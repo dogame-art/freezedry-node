@@ -192,7 +192,37 @@ app.get('/artworks', (req, reply) => {
 
 // ─── Serve cached blob ───
 
+/**
+ * Serve cached blob — peer-gated by default.
+ *
+ * The metadata (artwork list, pointers, verify) is free — that's just the directory.
+ * The blob data represents real cost (RPC credits, indexing time, compute).
+ * Active peers get instant blob access. Non-peers get the path info for free
+ * and can read the chain themselves.
+ *
+ * Set BLOB_PUBLIC=true in .env to serve blobs to everyone (open cache mode).
+ */
+const BLOB_PUBLIC = (process.env.BLOB_PUBLIC || 'false') === 'true';
+
 app.get('/blob/:hash', (req, reply) => {
+  // Peer gate: require active peer unless BLOB_PUBLIC=true
+  if (!BLOB_PUBLIC) {
+    const authHeader = req.headers['authorization'] || '';
+    const nodeUrl = req.headers['x-node-url'] || '';
+    const peers = db.listPeers();
+    const isAuthed = WEBHOOK_SECRET && authHeader === WEBHOOK_SECRET;
+    const isPeer = nodeUrl && peers.some(p => p.url === nodeUrl);
+
+    if (!isAuthed && !isPeer) {
+      reply.status(403);
+      return {
+        error: 'Blob data requires active peer registration',
+        hint: 'Use /sync/announce to register as a peer, or read the chain directly',
+        artwork: `/artwork/${req.params.hash}`,
+      };
+    }
+  }
+
   const blob = db.getBlob(req.params.hash);
   if (!blob) {
     reply.status(404);
