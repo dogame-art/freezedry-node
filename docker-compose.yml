@@ -1,0 +1,11 @@
+services:
+  freezedry-node:
+    build: .
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./db:/app/db
+      - ./.env:/app/.env:ro
+    restart: unless-stopped
+    environment:
+      - NODE_ENV=production
