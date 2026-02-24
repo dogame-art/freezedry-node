@@ -101,6 +101,7 @@ const stmts = {
   `),
 
   listPeers: db.prepare(`SELECT * FROM peers WHERE status = 'active' ORDER BY last_seen DESC`),
+  stalePeers: db.prepare(`UPDATE peers SET status = 'stale' WHERE status = 'active' AND last_seen < ?`),
 };
 
 // Transaction wrapper for bulk inserts
@@ -179,6 +180,12 @@ export function upsertPeer(url) {
 
 export function listPeers() {
   return stmts.listPeers.all();
+}
+
+/** Mark peers as stale if not seen in the given window (default 24h) */
+export function cleanStalePeers(maxAgeMs = 24 * 60 * 60 * 1000) {
+  const cutoff = Date.now() - maxAgeMs;
+  return stmts.stalePeers.run(cutoff);
 }
 
 export { db };

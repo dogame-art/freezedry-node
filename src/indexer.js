@@ -128,11 +128,20 @@ export function startIndexer(logger) {
   pollLoop();
 }
 
+let pollCount = 0;
+
 async function pollLoop() {
   while (true) {
     try {
       await scanForPointerMemos();
       await fillIncomplete();
+
+      // Every 10 polls (~20 min): clean stale peers, re-gossip
+      pollCount++;
+      if (pollCount % 10 === 0) {
+        db.cleanStalePeers();
+        await gossipPeers().catch(() => {});
+      }
     } catch (err) {
       log.warn(`Indexer poll error: ${err.message}`);
     }
@@ -359,9 +368,9 @@ async function fillFromPeers(artwork) {
 
   for (const peer of peers) {
     try {
-      const resp = await fetch(`${peer.url}/blob/${encodeURIComponent(artwork.hash)}`, {
-        signal: AbortSignal.timeout(30000),
-      });
+      const headers = { signal: AbortSignal.timeout(30000) };
+      if (NODE_URL) headers.headers = { 'X-Node-URL': NODE_URL };
+      const resp = await fetch(`${peer.url}/blob/${encodeURIComponent(artwork.hash)}`, headers);
       if (!resp.ok) continue;
 
       const blobBuffer = Buffer.from(await resp.arrayBuffer());

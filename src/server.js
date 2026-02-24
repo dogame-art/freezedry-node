@@ -316,7 +316,26 @@ app.post('/webhook/helius', async (req, reply) => {
 
 // ─── Peer Sync endpoints ───
 
-app.get('/sync/list', (req) => {
+/** Check if the requesting node is a registered active peer */
+function requireActivePeer(req, reply) {
+  // Check by auth header (preferred) or by IP matching a known peer URL
+  const authHeader = req.headers['authorization'] || '';
+  if (WEBHOOK_SECRET && authHeader === WEBHOOK_SECRET) return true;
+
+  // Check if requester's origin matches a known peer
+  const origin = req.headers['origin'] || req.headers['referer'] || '';
+  const peers = db.listPeers();
+  const isPeer = peers.some(p => origin.startsWith(p.url) || req.headers['x-node-url'] === p.url);
+  if (isPeer) return true;
+
+  reply.status(403);
+  return false;
+}
+
+app.get('/sync/list', (req, reply) => {
+  if (requireActivePeer(req, reply) === false) {
+    return { error: 'Peer sync requires active peer registration. Use /sync/announce first.' };
+  }
   const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
   const artworks = db.listArtworks(limit, 0);
   return {
@@ -331,6 +350,9 @@ app.get('/sync/list', (req) => {
 });
 
 app.get('/sync/chunks/:hash', (req, reply) => {
+  if (requireActivePeer(req, reply) === false) {
+    return { error: 'Peer sync requires active peer registration. Use /sync/announce first.' };
+  }
   const blob = db.getBlob(req.params.hash);
   if (!blob) {
     reply.status(404);
