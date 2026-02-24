@@ -193,33 +193,75 @@ app.get('/artworks', (req, reply) => {
 // ─── Serve cached blob ───
 
 /**
- * Serve cached blob — peer-gated by default.
+ * Serve cached blob — peer-gated with liveness verification.
  *
- * The metadata (artwork list, pointers, verify) is free — that's just the directory.
- * The blob data represents real cost (RPC credits, indexing time, compute).
- * Active peers get instant blob access. Non-peers get the path info for free
- * and can read the chain themselves.
+ * The metadata (artwork list, pointers, verify) is free — that's the directory.
+ * Blob data represents real cost (RPC credits, indexing time, compute).
+ * To get blobs, a peer must be:
+ *   1. Registered (via /sync/announce)
+ *   2. LIVE right now (we ping their /health before serving)
  *
- * Set BLOB_PUBLIC=true in .env to serve blobs to everyone (open cache mode).
+ * This prevents hit-and-run: register, scrape everything, disconnect.
+ * If your node isn't reachable, you read the chain yourself.
+ *
+ * Set BLOB_PUBLIC=true in .env to skip all checks (open cache mode).
  */
 const BLOB_PUBLIC = (process.env.BLOB_PUBLIC || 'false') === 'true';
 
-app.get('/blob/:hash', (req, reply) => {
-  // Peer gate: require active peer unless BLOB_PUBLIC=true
-  if (!BLOB_PUBLIC) {
-    const authHeader = req.headers['authorization'] || '';
-    const nodeUrl = req.headers['x-node-url'] || '';
-    const peers = db.listPeers();
-    const isAuthed = WEBHOOK_SECRET && authHeader === WEBHOOK_SECRET;
-    const isPeer = nodeUrl && peers.some(p => p.url === nodeUrl);
+// Cache liveness checks for 5 minutes to avoid hammering peers on every request
+const livenessCache = new Map();
+const LIVENESS_TTL = 5 * 60 * 1000;
 
-    if (!isAuthed && !isPeer) {
-      reply.status(403);
-      return {
-        error: 'Blob data requires active peer registration',
-        hint: 'Use /sync/announce to register as a peer, or read the chain directly',
-        artwork: `/artwork/${req.params.hash}`,
-      };
+async function isPeerLive(nodeUrl) {
+  if (!nodeUrl) return false;
+
+  // Check cache first
+  const cached = livenessCache.get(nodeUrl);
+  if (cached && Date.now() - cached.time < LIVENESS_TTL) return cached.alive;
+
+  // Ping their /health
+  try {
+    const resp = await fetch(`${nodeUrl}/health`, { signal: AbortSignal.timeout(5000) });
+    const alive = resp.ok;
+    livenessCache.set(nodeUrl, { alive, time: Date.now() });
+    if (alive) db.upsertPeer(nodeUrl); // refresh last_seen on success
+    return alive;
+  } catch {
+    livenessCache.set(nodeUrl, { alive: false, time: Date.now() });
+    return false;
+  }
+}
+
+app.get('/blob/:hash', async (req, reply) => {
+  if (!BLOB_PUBLIC) {
+    // Auth bypass for trusted callers
+    const authHeader = req.headers['authorization'] || '';
+    const isAuthed = WEBHOOK_SECRET && authHeader === WEBHOOK_SECRET;
+
+    if (!isAuthed) {
+      // Must be a registered peer AND currently live
+      const nodeUrl = req.headers['x-node-url'] || '';
+      const peers = db.listPeers();
+      const isPeer = nodeUrl && peers.some(p => p.url === nodeUrl);
+
+      if (!isPeer) {
+        reply.status(403);
+        return {
+          error: 'Blob data requires active peer registration',
+          hint: 'Use /sync/announce to register, then include X-Node-URL header',
+        };
+      }
+
+      // Liveness check — is the peer actually running right now?
+      const live = await isPeerLive(nodeUrl);
+      if (!live) {
+        reply.status(403);
+        return {
+          error: 'Peer node not reachable — blob access requires a live node',
+          hint: 'Make sure your node is running and publicly accessible',
+          checked: nodeUrl,
+        };
+      }
     }
   }
 
