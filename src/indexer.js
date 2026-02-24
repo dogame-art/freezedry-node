@@ -341,35 +341,49 @@ async function seedFromRegistry() {
   if (!REGISTRY_URL) return;
 
   log.info('Indexer: seeding from registry...');
-  const url = REGISTRY_URL.includes('/api/registry')
-    ? `${REGISTRY_URL}?action=list&limit=200`
-    : `${REGISTRY_URL}/api/registry?action=list&limit=200`;
-  const resp = await fetch(url);
-  if (!resp.ok) throw new Error(`Registry returned ${resp.status}`);
+  const baseUrl = REGISTRY_URL.includes('/api/registry')
+    ? REGISTRY_URL
+    : `${REGISTRY_URL}/api/registry`;
 
-  const { artworks } = await resp.json();
-  if (!artworks || artworks.length === 0) return;
-
+  let page = 1;
   let newCount = 0;
-  for (const art of artworks) {
-    const existing = db.getArtwork(art.hash);
-    if (existing) continue;
+  let totalPages = 1;
 
-    db.upsertArtwork({
-      hash: art.hash,
-      chunkCount: art.chunkCount || 0,
-      blobSize: art.blobSize || null,
-      width: art.width || null,
-      height: art.height || null,
-      mode: art.mode || 'open',
-      network: art.network || 'mainnet',
-      pointerSig: null,
-      chunks: null,
-    });
-    newCount++;
+  while (page <= totalPages) {
+    const resp = await fetch(`${baseUrl}?action=list&limit=100&page=${page}&showLocked=true`);
+    if (!resp.ok) {
+      log.warn(`Indexer: registry page ${page} returned ${resp.status}, stopping seed`);
+      break;
+    }
+
+    const data = await resp.json();
+    const artworks = data.artworks || [];
+    totalPages = data.pages || 1;
+
+    if (artworks.length === 0) break;
+
+    for (const art of artworks) {
+      const existing = db.getArtwork(art.hash);
+      if (existing) continue;
+
+      db.upsertArtwork({
+        hash: art.hash,
+        chunkCount: art.chunkCount || 0,
+        blobSize: art.blobSize || null,
+        width: art.width || null,
+        height: art.height || null,
+        mode: art.mode || 'open',
+        network: art.network || 'mainnet',
+        pointerSig: null,
+        chunks: null,
+      });
+      newCount++;
+    }
+
+    page++;
   }
 
-  log.info(`Indexer: seeded ${newCount} new artworks from registry`);
+  log.info(`Indexer: seeded ${newCount} new artworks from registry (${totalPages} pages)`);
 }
 
 // ─── Enhanced API helpers (paid plans) ───
