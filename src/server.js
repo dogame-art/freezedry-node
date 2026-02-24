@@ -153,6 +153,7 @@ app.addHook('onRequest', (req, reply, done) => {
 app.get('/health', () => {
   const mem = process.memoryUsage();
   const stats = db.getStats();
+  const peers = db.listPeers();
   return {
     status: 'ok',
     service: 'freezedry-node',
@@ -163,6 +164,7 @@ app.get('/health', () => {
       heap: (mem.heapUsed / 1024 / 1024).toFixed(1) + ' MB',
     },
     indexed: stats,
+    peers: peers.length,
   };
 });
 
@@ -342,7 +344,21 @@ app.get('/sync/chunks/:hash', (req, reply) => {
   };
 });
 
-// Announce a peer — requires webhook secret to prevent fake registrations
+// List known peers (public — enables gossip protocol)
+app.get('/nodes', (req, reply) => {
+  const ip = req.ip || 'unknown';
+  if (!checkRate(ip)) { reply.status(429); return { error: 'Rate limit exceeded' }; }
+  const peers = db.listPeers();
+  const NODE_URL = process.env.NODE_URL || '';
+  return {
+    nodeId: NODE_ID,
+    self: NODE_URL || null,
+    nodes: peers.map(p => ({ url: p.url, lastSeen: p.last_seen })),
+  };
+});
+
+// Announce a peer — requires webhook secret to prevent fake registrations.
+// Bidirectional: when a peer announces, we announce back if we have NODE_URL.
 app.post('/sync/announce', async (req, reply) => {
   const authErr = requireWebhookAuth(req, reply);
   if (authErr) return authErr;
@@ -350,7 +366,24 @@ app.post('/sync/announce', async (req, reply) => {
   const { url } = req.body || {};
   if (!url) return { error: 'Missing url' };
   db.upsertPeer(url);
-  return { ok: true };
+
+  // Bidirectional: announce back to the peer
+  const NODE_URL = process.env.NODE_URL || '';
+  if (NODE_URL && url !== NODE_URL) {
+    try {
+      await fetch(`${url}/sync/announce`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': WEBHOOK_SECRET,
+        },
+        body: JSON.stringify({ url: NODE_URL }),
+        signal: AbortSignal.timeout(5000),
+      });
+    } catch {} // best-effort
+  }
+
+  return { ok: true, registered: url };
 });
 
 // ─── Start ───

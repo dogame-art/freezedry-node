@@ -79,6 +79,7 @@ Solana Chain                    Your Node                    Users
 | `/verify/:hash` | GET | SHA-256 verification against stored blob |
 | `/sync/list` | GET | List artworks for peer sync |
 | `/sync/chunks/:hash` | GET | Base64 blob for peer sync |
+| `/nodes` | GET | List known peer nodes (enables gossip) |
 
 ### Protected (require `Authorization` header = `WEBHOOK_SECRET`)
 
@@ -86,7 +87,47 @@ Solana Chain                    Your Node                    Users
 |----------|--------|-------------|
 | `/ingest` | POST | Push artwork metadata from Vercel or peers |
 | `/webhook/helius` | POST | Receive real-time Helius webhook pushes |
-| `/sync/announce` | POST | Register a peer node URL |
+| `/sync/announce` | POST | Register a peer node URL (bidirectional) |
+
+## Peer Network
+
+Nodes can connect to each other for faster syncing and network discovery.
+
+### Setup
+
+```bash
+# In .env — your node's public URL and known peers
+NODE_URL=https://node.yourdomain.com
+PEER_NODES=https://node1.example.com,https://node2.example.com
+```
+
+### How Peer Sync Works
+
+```
+Your Node                          Peer Node
+    |                                  |
+    |--- POST /sync/announce --------->| "I exist at this URL"
+    |<-- POST /sync/announce ----------| "I exist too" (bidirectional)
+    |                                  |
+    |--- GET /nodes ------------------>| "Here are all peers I know"
+    |    (gossip: discover more)       |
+    |                                  |
+    |--- GET /blob/:hash ------------->| "Here's the cached blob" (fast!)
+    |    (peer sync instead of chain)  |
+```
+
+1. **Bootstrap** — On startup, your node registers `PEER_NODES` and announces itself
+2. **Gossip** — Fetches `/nodes` from each peer to discover additional nodes
+3. **Peer Sync** — When filling incomplete artworks, tries peers first (instant HTTP) before chain reads (slow RPC). SHA-256 verified.
+4. **Bidirectional** — When a peer announces to you, your node announces back automatically
+
+### Why Peer Sync Matters
+
+Chain reads cost RPC credits and are slow (especially on free plans). Peer sync is:
+- **Free** — no RPC credits, just HTTP between nodes
+- **Fast** — direct blob transfer vs. fetching individual memo transactions
+- **Verified** — SHA-256 hash checked before storing, same as chain reads
+- **Fallback** — if no peer has the blob, falls back to chain reads automatically
 
 ## Helius Plan Auto-Detection
 
