@@ -1,8 +1,10 @@
 # Freeze Dry Node
 
-A lightweight indexer and cache node for the [Freeze Dry Protocol](https://freezedry.dogame.art) — on-chain art storage on Solana.
+A lightweight indexer and cache node for the [Freeze Dry Protocol](https://github.com/dogame-art/freezedry-protocol) — on-chain art storage on Solana.
 
 Nodes scan the Solana blockchain for `FREEZEDRY:` pointer memos, fetch the associated chunk data, and serve reconstructed artwork blobs over HTTP. The chain is the source of truth; nodes are a discovery and caching layer.
+
+**Full app**: [freezedry.dogame.art](https://freezedry.dogame.art) — managed inscriptions, NFT minting, and fast hydration.
 
 ## 5-Minute Setup
 
@@ -147,6 +149,36 @@ Instead of polling every 2 minutes, configure a Helius webhook to push new trans
 4. Set auth header to your `WEBHOOK_SECRET`
 5. Select "Enhanced" format
 
+## How Indexing Works
+
+There are two ways your node discovers content:
+
+### 1. Chain Polling (primary)
+
+The indexer runs a polling loop every 2 minutes (configurable via `POLL_INTERVAL`):
+
+1. **Discover** — Scans the configured `SERVER_WALLET` for `FREEZEDRY:` pointer memos
+2. **Index** — Stores metadata (hash, chunk count, size) in local SQLite
+3. **Fill** — For each discovered artwork with no cached chunks, fetches the actual memo transactions from Solana using **your own** Helius key
+4. **Serve** — Chunks are reassembled into `.hyd` blobs and cached in SQLite
+
+After the initial scan, the node only checks for new transactions since the last known signature.
+
+### 2. Registry Seeding (optional bootstrap)
+
+If `REGISTRY_URL` is set in `.env`, the node does a one-time backfill on startup:
+
+1. Fetches the artwork list from a registry endpoint (metadata only — hash, chunk count, dimensions)
+2. Stores entries in local SQLite with `chunks: null`
+3. The regular fill loop then fetches actual chunk data from the chain
+
+**This only transfers metadata** (a table of contents). Actual artwork data always comes from the Solana blockchain using your own RPC credits. The registry just tells your node "these artworks exist" so it doesn't have to scan the entire chain history.
+
+```bash
+# Example: seed from the official Freeze Dry registry
+REGISTRY_URL=https://freezedry.dogame.art
+```
+
 ## Security
 
 - All write endpoints (`/ingest`, `/webhook/helius`, `/sync/announce`) require the `Authorization` header to match `WEBHOOK_SECRET`
@@ -154,6 +186,11 @@ Instead of polling every 2 minutes, configure a Helius webhook to push new trans
 - Read endpoints are rate-limited (120 req/min per IP)
 - Write endpoints are rate-limited (10 req/min per IP)
 - CORS is open (`*`) — nodes are public read APIs by design
+
+## Related
+
+- [freezedry-protocol](https://github.com/dogame-art/freezedry-protocol) — SDK packages + standalone HTML tools
+- [freezedry.dogame.art](https://freezedry.dogame.art) — Full app with managed infrastructure
 
 ## License
 
