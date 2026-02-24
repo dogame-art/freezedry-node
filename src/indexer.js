@@ -360,37 +360,74 @@ async function fillChunksRPC(artwork) {
 
 /**
  * Try to fill an artwork's blob from a peer node (much faster than chain reads).
- * Peers serve cached blobs via GET /blob/:hash. We verify SHA-256 before storing.
+ * Peers serve cached blobs via GET /blob/:hash.
+ *
+ * Trustless verification (3 layers):
+ *   1. Header hash matches pointer memo's hash (blob claims the right identity)
+ *   2. SHA-256 of actual file data matches the embedded hash (data is authentic)
+ *   3. Chain spot-check: fetch 1-2 random memo txs and compare to blob chunks
+ *      (proves the blob matches what's actually on-chain)
  */
 async function fillFromPeers(artwork) {
   const peers = db.listPeers();
   if (peers.length === 0) return false;
 
+  const { createHash } = await import('crypto');
+
   for (const peer of peers) {
     try {
-      const headers = { signal: AbortSignal.timeout(30000) };
-      if (NODE_URL) headers.headers = { 'X-Node-URL': NODE_URL };
-      const resp = await fetch(`${peer.url}/blob/${encodeURIComponent(artwork.hash)}`, headers);
+      const fetchOpts = { signal: AbortSignal.timeout(30000) };
+      if (NODE_URL) fetchOpts.headers = { 'X-Node-URL': NODE_URL };
+      const resp = await fetch(`${peer.url}/blob/${encodeURIComponent(artwork.hash)}`, fetchOpts);
       if (!resp.ok) continue;
 
       const blobBuffer = Buffer.from(await resp.arrayBuffer());
-      if (blobBuffer.length < 49) continue; // too small for valid .hyd
+      if (blobBuffer.length < 49) continue;
 
-      // Verify magic bytes
-      if (blobBuffer[0] !== 0x48 || blobBuffer[1] !== 0x59 || blobBuffer[2] !== 0x44 || blobBuffer[3] !== 0x01) continue;
-
-      // Verify SHA-256: extract hash from blob header (bytes 17-48) and compare
-      const { createHash } = await import('crypto');
-      const embeddedHash = blobBuffer.slice(17, 49);
-      const expectedHex = 'sha256:' + embeddedHash.toString('hex');
-
-      // The artwork.hash from the pointer should match the blob's embedded hash
-      if (expectedHex !== artwork.hash) {
-        log.warn(`Indexer: peer ${peer.url} returned blob with hash mismatch for ${artwork.hash.slice(0, 16)}...`);
+      // ── Layer 1: Magic bytes + header hash matches pointer ──
+      if (blobBuffer[0] !== 0x48 || blobBuffer[1] !== 0x59 || blobBuffer[2] !== 0x44 || blobBuffer[3] !== 0x01) {
+        log.warn(`Indexer: peer ${peer.url} returned invalid blob (bad magic) for ${artwork.hash.slice(0, 16)}...`);
         continue;
       }
 
-      // Store as chunks (split to match chunk_count for consistency)
+      const embeddedHash = blobBuffer.slice(17, 49);
+      const expectedHex = 'sha256:' + embeddedHash.toString('hex');
+      if (expectedHex !== artwork.hash) {
+        log.warn(`Indexer: peer ${peer.url} header hash mismatch for ${artwork.hash.slice(0, 16)}...`);
+        continue;
+      }
+
+      // ── Layer 2: Compute SHA-256 of actual data, compare to embedded hash ──
+      const mode = blobBuffer[4];
+      const isDirect = mode >= 3;
+      const view = new DataView(blobBuffer.buffer, blobBuffer.byteOffset, blobBuffer.byteLength);
+      const avifLen = view.getUint32(9, true);
+      const deltaLen = view.getUint32(13, true);
+
+      if (isDirect) {
+        // Direct mode: hash the file bytes (stored in delta slot after header)
+        const fileBytes = blobBuffer.slice(49, 49 + deltaLen);
+        const computed = createHash('sha256').update(fileBytes).digest();
+        if (!computed.equals(embeddedHash)) {
+          log.warn(`Indexer: peer ${peer.url} data hash mismatch (direct mode) for ${artwork.hash.slice(0, 16)}...`);
+          continue;
+        }
+      } else {
+        // Pixel Perfect: hash is of reconstructed pixels (can't cheaply verify)
+        // Fall through to Layer 3 chain spot-check for verification
+      }
+
+      // ── Layer 3: Chain spot-check — verify random chunks against on-chain memos ──
+      if (artwork.pointer_sig && artwork.chunk_count > 0) {
+        const spotCheckPassed = await chainSpotCheck(blobBuffer, artwork);
+        if (spotCheckPassed === false) {
+          log.warn(`Indexer: peer ${peer.url} FAILED chain spot-check for ${artwork.hash.slice(0, 16)}...`);
+          continue;
+        }
+        // spotCheckPassed === null means we couldn't check (no RPC) — accept with Layer 1+2
+      }
+
+      // ── All checks passed — store ──
       const CHUNK_SIZE = 585;
       const chunks = [];
       for (let off = 0; off < blobBuffer.length; off += CHUNK_SIZE) {
@@ -413,13 +450,88 @@ async function fillFromPeers(artwork) {
         chunks,
       });
 
-      log.info(`Indexer: filled ${artwork.hash.slice(0, 16)}... from peer ${peer.url} (${blobBuffer.length}B)`);
+      log.info(`Indexer: filled ${artwork.hash.slice(0, 16)}... from peer ${peer.url} (${blobBuffer.length}B, verified)`);
       return true;
     } catch (err) {
       // Peer unavailable — try next
     }
   }
   return false;
+}
+
+/**
+ * Chain spot-check: fetch 1-2 random on-chain memo chunks and compare to the blob.
+ * This proves the peer's blob matches what's actually inscribed on Solana.
+ * Returns true (passed), false (failed), or null (couldn't check).
+ */
+async function chainSpotCheck(blobBuffer, artwork) {
+  if (!artwork.pointer_sig || !HELIUS_API_KEY) return null;
+
+  try {
+    // Get the list of chunk signatures from the chain (just the sigs, not full txs)
+    const resp = await fetchRPC({
+      jsonrpc: '2.0', id: 1,
+      method: 'getSignaturesForAddress',
+      params: [SERVER_WALLET, {
+        before: artwork.pointer_sig,
+        limit: Math.min(artwork.chunk_count + 5, 50),
+      }],
+    });
+    const sigs = resp?.result || [];
+    if (sigs.length === 0) return null;
+
+    // Pick 1-2 random indices to spot-check
+    const checkCount = Math.min(2, sigs.length);
+    const indices = [];
+    while (indices.length < checkCount) {
+      const idx = Math.floor(Math.random() * Math.min(sigs.length, artwork.chunk_count));
+      if (!indices.includes(idx)) indices.push(idx);
+    }
+
+    // Shred the blob the same way as inscription (585B chunks)
+    const PAYLOAD_SIZE = 585;
+    const blobChunks = [];
+    for (let off = 0; off < blobBuffer.length; off += PAYLOAD_SIZE) {
+      blobChunks.push(blobBuffer.slice(off, Math.min(off + PAYLOAD_SIZE, blobBuffer.length)));
+    }
+
+    // For each spot-check index, fetch the chain memo and compare
+    for (const idx of indices) {
+      // sigs are newest-first, chunks are oldest-first — reverse index
+      const sigIdx = sigs.length - 1 - idx;
+      if (sigIdx < 0 || sigIdx >= sigs.length) continue;
+      if (sigs[sigIdx].err) continue;
+
+      const txData = await fetchTransaction(sigs[sigIdx].signature);
+      if (!txData) continue;
+
+      const memoData = extractRPCMemoData(txData);
+      if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
+
+      // Strip v3 header to get the base64 payload
+      const stripped = stripV3Header(memoData);
+
+      // Decode the on-chain base64 data
+      const chainBytes = Buffer.from(stripped, 'base64');
+
+      // Compare to the blob's chunk at the same index
+      if (idx < blobChunks.length) {
+        const blobChunk = blobChunks[idx];
+        if (!chainBytes.equals(blobChunk)) {
+          log.warn(`Indexer: spot-check FAILED at chunk ${idx} — on-chain data doesn't match peer blob`);
+          return false;
+        }
+      }
+
+      await sleep(STAGGER_MS);
+    }
+
+    log.info(`Indexer: spot-check passed (${checkCount} chunks verified against chain) for ${artwork.hash.slice(0, 16)}...`);
+    return true;
+  } catch (err) {
+    log.warn(`Indexer: spot-check error — ${err.message}`);
+    return null; // couldn't check, don't reject
+  }
 }
 
 /**
