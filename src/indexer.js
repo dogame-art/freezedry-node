@@ -15,7 +15,7 @@
 import * as db from './db.js';
 
 // Env vars read lazily — loadEnv() in server.js must run first
-let HELIUS_API_KEY, HELIUS_RPC, SERVER_WALLET, REGISTRY_URL, POLL_INTERVAL, PEER_NODES, NODE_URL;
+let HELIUS_API_KEY, HELIUS_RPC, SERVER_WALLET, REGISTRY_URL, POLL_INTERVAL, PEER_NODES, NODE_URL, GENESIS_SIG;
 
 // Auto-detected: true = paid key with Enhanced API, false = free key (RPC only)
 let useEnhancedAPI = null; // null = not yet detected
@@ -24,10 +24,13 @@ function loadConfig() {
   HELIUS_API_KEY = process.env.HELIUS_API_KEY || '';
   HELIUS_RPC = process.env.HELIUS_RPC_URL || `https://mainnet.helius-rpc.com/?api-key=${HELIUS_API_KEY}`;
   SERVER_WALLET = process.env.SERVER_WALLET || '6ao3hnvKQJfmQ94xTMV34uLUP6azVNHzCfip1ic5Nafj';
-  REGISTRY_URL = process.env.REGISTRY_URL || '';
+  REGISTRY_URL = process.env.REGISTRY_URL || 'https://freezedry.art';
   POLL_INTERVAL = parseInt(process.env.POLL_INTERVAL || '120000', 10);
   PEER_NODES = (process.env.PEER_NODES || '').split(',').map(s => s.trim()).filter(Boolean);
   NODE_URL = process.env.NODE_URL || '';
+  // Hard stop for backwards pagination — don't scan older than this signature.
+  // Saves RPC credits on first scan. Set to the first Freeze Dry inscription sig.
+  GENESIS_SIG = process.env.GENESIS_SIG || '';
   // Allow explicit override via env var
   if (process.env.USE_ENHANCED_API === 'true') useEnhancedAPI = true;
   if (process.env.USE_ENHANCED_API === 'false') useEnhancedAPI = false;
@@ -230,6 +233,16 @@ async function scanEnhanced() {
     before = txs[txs.length - 1].signature;
     db.setKV('oldest_scanned_sig', before);
 
+    // Genesis sig: hard stop — don't scan older than the first Freeze Dry inscription
+    if (GENESIS_SIG && txs.some(tx => tx.signature === GENESIS_SIG)) {
+      if (!initialScanDone) {
+        initialScanDone = true;
+        db.setKV('initial_scan_done', 'true');
+        log.info('Indexer: reached genesis signature — initial scan complete');
+      }
+      break;
+    }
+
     // If batch was smaller than limit, we've reached the end of history
     if (txs.length < 100) {
       if (!initialScanDone) {
@@ -299,6 +312,16 @@ async function scanRPC() {
 
     before = sigs[sigs.length - 1].signature;
     db.setKV('oldest_scanned_sig', before);
+
+    // Genesis sig: hard stop
+    if (GENESIS_SIG && sigs.some(s => s.signature === GENESIS_SIG)) {
+      if (!initialScanDone) {
+        initialScanDone = true;
+        db.setKV('initial_scan_done', 'true');
+        log.info('Indexer: reached genesis signature — initial scan complete');
+      }
+      break;
+    }
 
     if (sigs.length < 50) {
       if (!initialScanDone) {
