@@ -219,6 +219,8 @@ async function scanEnhanced() {
       const existing = db.getArtwork(pointer.hash);
       if (existing) {
         hitKnown = true;
+        // Backfill pointer_sig on registry-seeded records that lack it
+        processPointerMemo(memoData, tx.signature);
         continue; // keep scanning this page (multiple pointers per batch)
       }
 
@@ -296,6 +298,8 @@ async function scanRPC() {
           const existing = db.getArtwork(pointer.hash);
           if (existing) {
             hitKnown = true;
+            // Backfill pointer_sig on registry-seeded records that lack it
+            processPointerMemo(memoData, sigInfo.signature);
             continue;
           }
         }
@@ -347,20 +351,37 @@ function processPointerMemo(memoData, signature) {
   if (!pointer.hash || isNaN(pointer.chunkCount) || pointer.chunkCount <= 0) return;
 
   const existing = db.getArtwork(pointer.hash);
-  if (!existing) {
-    db.upsertArtwork({
-      hash: pointer.hash,
-      chunkCount: pointer.chunkCount,
-      blobSize: pointer.blobSize || null,
-      width: null,
-      height: null,
-      mode: 'open',
-      network: 'mainnet',
-      pointerSig: signature,
-      chunks: null,
-    });
-    log.info(`Indexer: discovered ${pointer.hash} (${pointer.chunkCount} chunks, v${pointer.version})`);
+  if (existing) {
+    // Existing record from registry seed may lack pointer_sig — backfill it
+    if (!existing.pointer_sig && signature) {
+      db.upsertArtwork({
+        hash: pointer.hash,
+        chunkCount: pointer.chunkCount || existing.chunk_count,
+        blobSize: pointer.blobSize || existing.blob_size,
+        width: existing.width,
+        height: existing.height,
+        mode: existing.mode || 'open',
+        network: existing.network || 'mainnet',
+        pointerSig: signature,
+        chunks: null,
+      });
+      log.info(`Indexer: backfilled pointer sig for ${pointer.hash.slice(0, 24)}...`);
+    }
+    return;
   }
+
+  db.upsertArtwork({
+    hash: pointer.hash,
+    chunkCount: pointer.chunkCount,
+    blobSize: pointer.blobSize || null,
+    width: null,
+    height: null,
+    mode: 'open',
+    network: 'mainnet',
+    pointerSig: signature,
+    chunks: null,
+  });
+  log.info(`Indexer: discovered ${pointer.hash} (${pointer.chunkCount} chunks, v${pointer.version})`);
 }
 
 // ─── Fill incomplete: fetch chunk data ───
