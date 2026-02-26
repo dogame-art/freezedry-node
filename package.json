@@ -1,14 +1,17 @@
 {
   "name": "freezedry-node",
-  "version": "1.0.0",
-  "description": "Freeze Dry indexer node — indexes and serves artwork from Solana memos",
+  "version": "2.0.0",
+  "description": "Freeze Dry unified node — reader, writer, or both. Indexes chain + inscribes memos.",
   "type": "module",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "setup": "bash scripts/setup.sh",
+    "register": "node scripts/register.js"
   },
   "dependencies": {
+    "@solana/web3.js": "^1.98.0",
     "better-sqlite3": "^11.7.0",
     "fastify": "^5.2.0"
   }

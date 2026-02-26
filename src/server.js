@@ -1,6 +1,7 @@
 /**
  * server.js — Freeze Dry Node HTTP server
- * Fastify-based API for serving cached artworks + receiving webhooks
+ * Fastify-based API for serving cached artworks + receiving webhooks.
+ * Supports ROLE-based startup: "reader", "writer", or "both" (default).
  */
 
 import Fastify from 'fastify';
@@ -10,6 +11,7 @@ import { fileURLToPath } from 'url';
 import { createHash } from 'crypto';
 import * as db from './db.js';
 import { startIndexer } from './indexer.js';
+import { registerWriterRoutes } from './writer/routes.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -80,7 +82,11 @@ loadEnv();
 const PORT = parseInt(process.env.PORT || '3100', 10);
 const NODE_ID = process.env.NODE_ID || 'freezedry-node';
 const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
+const ROLE = (process.env.ROLE || 'both').toLowerCase(); // "reader", "writer", or "both"
 const startTime = Date.now();
+
+const isReader = ROLE === 'reader' || ROLE === 'both';
+const isWriter = ROLE === 'writer' || ROLE === 'both';
 
 // ─── Startup validation ───
 if (!WEBHOOK_SECRET) {
@@ -140,7 +146,7 @@ const app = Fastify({ logger: true });
 app.addHook('onRequest', (req, reply, done) => {
   reply.header('Access-Control-Allow-Origin', '*');
   reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization');
+  reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
   if (req.method === 'OPTIONS') {
     reply.status(204).send();
     return;
@@ -157,6 +163,7 @@ app.get('/health', () => {
   return {
     status: 'ok',
     service: 'freezedry-node',
+    role: ROLE,
     nodeId: NODE_ID,
     uptime: Math.floor((Date.now() - startTime) / 1000),
     memory: {
@@ -484,11 +491,18 @@ app.post('/sync/announce', async (req, reply) => {
 
 async function start() {
   try {
-    await app.listen({ port: PORT, host: '0.0.0.0' });
-    app.log.info(`Freeze Dry Node (${NODE_ID}) listening on :${PORT}`);
+    // Register writer routes before listening (if writer role)
+    if (isWriter) {
+      registerWriterRoutes(app);
+    }
 
-    // Start the chain indexer
-    startIndexer(app.log);
+    await app.listen({ port: PORT, host: '0.0.0.0' });
+    app.log.info(`Freeze Dry Node (${NODE_ID}) listening on :${PORT} [role=${ROLE}]`);
+
+    // Start the chain indexer (if reader role)
+    if (isReader) {
+      startIndexer(app.log);
+    }
   } catch (err) {
     app.log.error(err);
     process.exit(1);
