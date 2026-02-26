@@ -202,6 +202,12 @@ async function scanEnhanced() {
   let discovered = 0;
   const MAX_PAGES = 100;   // safety cap: 10,000 txs max per poll
 
+  // If any artworks lack pointer_sig, force full scan to backfill them
+  const needsBackfill = db.getIncomplete().some(a => !a.pointer_sig);
+  if (needsBackfill) {
+    log.info('Indexer: artworks need pointer_sig backfill — doing full scan');
+  }
+
   for (let page = 0; page < MAX_PAGES; page++) {
     const txs = await fetchEnhancedTransactions(SERVER_WALLET, before);
     if (!txs || txs.length === 0) break;
@@ -218,7 +224,7 @@ async function scanEnhanced() {
       // Check if already known — if so, we've reached indexed territory
       const existing = db.getArtwork(pointer.hash);
       if (existing) {
-        hitKnown = true;
+        if (existing.pointer_sig) hitKnown = true;
         // Backfill pointer_sig on registry-seeded records that lack it
         processPointerMemo(memoData, tx.signature);
         continue; // keep scanning this page (multiple pointers per batch)
@@ -229,7 +235,8 @@ async function scanEnhanced() {
     }
 
     // If we hit a known artwork, everything older is already indexed — stop
-    if (hitKnown && initialScanDone) break;
+    // BUT: skip this optimization if artworks need pointer_sig backfill
+    if (hitKnown && initialScanDone && !needsBackfill) break;
 
     // Update backward cursor for initial full-history scan
     before = txs[txs.length - 1].signature;
@@ -272,6 +279,9 @@ async function scanRPC() {
   let discovered = 0;
   const MAX_PAGES = 100;
 
+  // If any artworks lack pointer_sig, force full scan to backfill them
+  const needsBackfill = db.getIncomplete().some(a => !a.pointer_sig);
+
   for (let page = 0; page < MAX_PAGES; page++) {
     const params = { limit: 50 };
     if (before) params.before = before;
@@ -297,8 +307,7 @@ async function scanRPC() {
         if (pointer && pointer.hash) {
           const existing = db.getArtwork(pointer.hash);
           if (existing) {
-            hitKnown = true;
-            // Backfill pointer_sig on registry-seeded records that lack it
+            if (existing.pointer_sig) hitKnown = true;
             processPointerMemo(memoData, sigInfo.signature);
             continue;
           }
@@ -312,7 +321,8 @@ async function scanRPC() {
       }
     }
 
-    if (hitKnown && initialScanDone) break;
+    // Skip early-exit if artworks need pointer_sig backfill
+    if (hitKnown && initialScanDone && !needsBackfill) break;
 
     before = sigs[sigs.length - 1].signature;
     db.setKV('oldest_scanned_sig', before);
@@ -827,17 +837,35 @@ async function seedFromRegistry() {
 
     for (const art of artworks) {
       const existing = db.getArtwork(art.hash);
-      if (existing) continue;
+      if (existing) {
+        // Backfill pointer_sig from registry if missing locally
+        if (!existing.pointer_sig && art.pointerSig) {
+          db.upsertArtwork({
+            hash: art.hash,
+            chunkCount: art.chunkCount || existing.chunk_count,
+            blobSize: art.blobSize || existing.blob_size,
+            width: art.width || existing.width,
+            height: art.height || existing.height,
+            mode: art.mode || existing.mode || 'open',
+            network: art.network || existing.network || 'mainnet',
+            pointerSig: art.pointerSig,
+            chunks: null,
+          });
+          log.info(`Indexer: backfilled pointer_sig from registry for ${art.hash.slice(0, 24)}...`);
+          newCount++;
+        }
+        continue;
+      }
 
       db.upsertArtwork({
         hash: art.hash,
-        chunkCount: art.chunkCount || 0,
+        chunkCount: art.chunkCount || art.sigCount || 0,
         blobSize: art.blobSize || null,
         width: art.width || null,
         height: art.height || null,
         mode: art.mode || 'open',
         network: art.network || 'mainnet',
-        pointerSig: null,
+        pointerSig: art.pointerSig || null,
         chunks: null,
       });
       newCount++;
@@ -873,17 +901,53 @@ async function fetchEnhancedTransactions(address, beforeSig, limit = 100) {
   return resp.json();
 }
 
-/** Extract memo data from Enhanced API transaction format */
+/** Extract memo data from Enhanced API transaction format.
+ *  Helius Enhanced API returns memo instruction data as base58 — decode to UTF-8. */
 function extractEnhancedMemoData(tx) {
   for (const ix of tx?.instructions || []) {
-    if (ix.programId === MEMO_PROGRAM && ix.data) return ix.data;
+    if (ix.programId === MEMO_PROGRAM && ix.data) return decodeBase58Memo(ix.data);
   }
   for (const inner of tx?.innerInstructions || []) {
     for (const ix of inner?.instructions || []) {
-      if (ix.programId === MEMO_PROGRAM && ix.data) return ix.data;
+      if (ix.programId === MEMO_PROGRAM && ix.data) return decodeBase58Memo(ix.data);
     }
   }
   return null;
+}
+
+/** Decode base58-encoded memo data to UTF-8 string.
+ *  Inline decoder — no external dependency needed. */
+const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+const B58_MAP = new Uint8Array(128).fill(255);
+for (let i = 0; i < B58_ALPHABET.length; i++) B58_MAP[B58_ALPHABET.charCodeAt(i)] = i;
+
+function decodeBase58(str) {
+  const bytes = [];
+  for (let i = 0; i < str.length; i++) {
+    let carry = B58_MAP[str.charCodeAt(i)];
+    if (carry === 255) throw new Error('Invalid base58 char');
+    for (let j = 0; j < bytes.length; j++) {
+      carry += bytes[j] * 58;
+      bytes[j] = carry & 0xff;
+      carry >>= 8;
+    }
+    while (carry > 0) {
+      bytes.push(carry & 0xff);
+      carry >>= 8;
+    }
+  }
+  // Leading '1's = leading zero bytes
+  for (let i = 0; i < str.length && str[i] === '1'; i++) bytes.push(0);
+  return Buffer.from(bytes.reverse());
+}
+
+function decodeBase58Memo(data) {
+  if (data.startsWith('FREEZEDRY:') || data.startsWith('FD:')) return data;
+  try {
+    return decodeBase58(data).toString('utf-8');
+  } catch {
+    return data;
+  }
 }
 
 // ─── Standard RPC helpers (free plan) ───
