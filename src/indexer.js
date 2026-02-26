@@ -40,7 +40,10 @@ const STAGGER_MS = 500;
 const MEMO_PROGRAM = 'MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr';
 
 let log = console;
-let lastSignature = null; // pagination cursor
+// Initial history scan cursor (persisted to SQLite — survives restarts)
+// Once the full history is scanned, this stays at the oldest known sig.
+let oldestScannedSig = null;
+let initialScanDone = false;
 
 /**
  * Parse a FREEZEDRY pointer memo string into structured data.
@@ -114,10 +117,20 @@ export function startIndexer(logger) {
 
   log.info(`Indexer: starting (poll every ${POLL_INTERVAL / 1000}s, wallet: ${SERVER_WALLET.slice(0, 8)}...)`);
 
+  // Restore scan state from SQLite
+  oldestScannedSig = db.getKV('oldest_scanned_sig') || null;
+  initialScanDone = db.getKV('initial_scan_done') === 'true';
+  if (initialScanDone) {
+    log.info('Indexer: resuming — initial history scan already complete');
+  }
+
   // Seed from registry on startup (backfill)
   if (REGISTRY_URL) {
     seedFromRegistry().catch(err => log.warn(`Registry seed failed: ${err.message}`));
   }
+
+  // Discover peers from coordinator + configured peers
+  discoverFromCoordinator().catch(err => log.warn(`Coordinator discovery failed: ${err.message}`));
 
   // Connect to peer network on startup
   if (PEER_NODES.length > 0 || NODE_URL) {
@@ -136,10 +149,11 @@ async function pollLoop() {
       await scanForPointerMemos();
       await fillIncomplete();
 
-      // Every 10 polls (~20 min): clean stale peers, re-gossip
+      // Every 10 polls (~20 min): clean stale peers, discover from coordinator, re-gossip
       pollCount++;
       if (pollCount % 10 === 0) {
         db.cleanStalePeers();
+        await discoverFromCoordinator().catch(() => {});
         await gossipPeers().catch(() => {});
       }
     } catch (err) {
@@ -173,54 +187,134 @@ async function scanForPointerMemos() {
   await scanRPC();
 }
 
-/** Scan via Enhanced Transactions API (paid plans — 100 credits per 100 results) */
+/**
+ * Scan via Enhanced Transactions API (paid plans — 100 credits per 100 results).
+ *
+ * Strategy: always start from newest (before=null), paginate backwards.
+ * Stop when we hit an already-known artwork hash — everything older is already indexed.
+ * On first run, walks the full history. On subsequent runs, only fetches new txs.
+ */
 async function scanEnhanced() {
-  const txs = await fetchEnhancedTransactions(SERVER_WALLET, lastSignature);
-  if (!txs || txs.length === 0) return;
+  let before = null;       // start from newest
+  let discovered = 0;
+  const MAX_PAGES = 100;   // safety cap: 10,000 txs max per poll
 
-  log.info(`Indexer: scanning ${txs.length} transactions via Enhanced API`);
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const txs = await fetchEnhancedTransactions(SERVER_WALLET, before);
+    if (!txs || txs.length === 0) break;
 
-  for (const tx of txs) {
-    if (tx.transactionError) continue;
-    const memoData = extractEnhancedMemoData(tx);
-    if (!memoData) continue;
+    let hitKnown = false;
+    for (const tx of txs) {
+      if (tx.transactionError) continue;
+      const memoData = extractEnhancedMemoData(tx);
+      if (!memoData) continue;
 
-    processPointerMemo(memoData, tx.signature);
+      const pointer = parsePointerMemo(memoData);
+      if (!pointer || !pointer.hash || isNaN(pointer.chunkCount) || pointer.chunkCount <= 0) continue;
+
+      // Check if already known — if so, we've reached indexed territory
+      const existing = db.getArtwork(pointer.hash);
+      if (existing) {
+        hitKnown = true;
+        continue; // keep scanning this page (multiple pointers per batch)
+      }
+
+      processPointerMemo(memoData, tx.signature);
+      discovered++;
+    }
+
+    // If we hit a known artwork, everything older is already indexed — stop
+    if (hitKnown && initialScanDone) break;
+
+    // Update backward cursor for initial full-history scan
+    before = txs[txs.length - 1].signature;
+    db.setKV('oldest_scanned_sig', before);
+
+    // If batch was smaller than limit, we've reached the end of history
+    if (txs.length < 100) {
+      if (!initialScanDone) {
+        initialScanDone = true;
+        db.setKV('initial_scan_done', 'true');
+        log.info('Indexer: initial full history scan complete');
+      }
+      break;
+    }
+
+    await sleep(200); // rate limit between pages
   }
 
-  lastSignature = txs[txs.length - 1].signature;
+  if (discovered > 0) {
+    log.info(`Indexer: discovered ${discovered} new artwork(s) via Enhanced API`);
+  }
 }
 
-/** Scan via standard RPC (free plan — getSignaturesForAddress + getTransaction) */
+/**
+ * Scan via standard RPC (free plan — getSignaturesForAddress + getTransaction).
+ * Same strategy: newest-first, stop on known artwork.
+ */
 async function scanRPC() {
-  const params = { limit: 50 };
-  if (lastSignature) params.before = lastSignature;
+  let before = null;
+  let discovered = 0;
+  const MAX_PAGES = 100;
 
-  const resp = await fetchRPC({
-    jsonrpc: '2.0', id: 1,
-    method: 'getSignaturesForAddress',
-    params: [SERVER_WALLET, params],
-  });
-  const sigs = resp?.result || [];
-  if (sigs.length === 0) return;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const params = { limit: 50 };
+    if (before) params.before = before;
 
-  log.info(`Indexer: scanning ${sigs.length} signatures via RPC`);
+    const resp = await fetchRPC({
+      jsonrpc: '2.0', id: 1,
+      method: 'getSignaturesForAddress',
+      params: [SERVER_WALLET, params],
+    });
+    const sigs = resp?.result || [];
+    if (sigs.length === 0) break;
 
-  for (const sigInfo of sigs) {
-    if (sigInfo.err) continue;
-    try {
-      const txData = await fetchTransaction(sigInfo.signature);
-      if (!txData) continue;
-      const memoData = extractRPCMemoData(txData);
-      if (!memoData) continue;
-      processPointerMemo(memoData, sigInfo.signature);
-      await sleep(STAGGER_MS);
-    } catch (err) {
-      log.warn(`Indexer: failed to process sig ${sigInfo.signature.slice(0, 12)}... — ${err.message}`);
+    let hitKnown = false;
+    for (const sigInfo of sigs) {
+      if (sigInfo.err) continue;
+      try {
+        const txData = await fetchTransaction(sigInfo.signature);
+        if (!txData) continue;
+        const memoData = extractRPCMemoData(txData);
+        if (!memoData) continue;
+
+        const pointer = parsePointerMemo(memoData);
+        if (pointer && pointer.hash) {
+          const existing = db.getArtwork(pointer.hash);
+          if (existing) {
+            hitKnown = true;
+            continue;
+          }
+        }
+
+        processPointerMemo(memoData, sigInfo.signature);
+        if (pointer && !db.getArtwork(pointer?.hash)) discovered++;
+        await sleep(STAGGER_MS);
+      } catch (err) {
+        log.warn(`Indexer: failed to process sig ${sigInfo.signature.slice(0, 12)}... — ${err.message}`);
+      }
     }
+
+    if (hitKnown && initialScanDone) break;
+
+    before = sigs[sigs.length - 1].signature;
+    db.setKV('oldest_scanned_sig', before);
+
+    if (sigs.length < 50) {
+      if (!initialScanDone) {
+        initialScanDone = true;
+        db.setKV('initial_scan_done', 'true');
+        log.info('Indexer: initial full history scan complete');
+      }
+      break;
+    }
+
+    await sleep(200);
   }
 
-  lastSignature = sigs[sigs.length - 1].signature;
+  if (discovered > 0) {
+    log.info(`Indexer: discovered ${discovered} new artwork(s) via RPC`);
+  }
 }
 
 /** Shared: process a potential pointer memo string */
@@ -622,6 +716,41 @@ async function gossipPeers() {
         try { await announceToNode(peer.url, NODE_URL); } catch {}
       }
     }
+  }
+}
+
+// ─── Coordinator discovery: learn about peers from freezedry.art ───
+
+const COORDINATOR_URL = process.env.COORDINATOR_URL || 'https://freezedry.art';
+
+/**
+ * Discover peer nodes from the coordinator's node registry.
+ * Nodes register with the coordinator (wallet-authed), and we discover them here.
+ * Runs on startup + every gossip cycle.
+ */
+async function discoverFromCoordinator() {
+  try {
+    const resp = await fetch(`${COORDINATOR_URL}/api/nodes?action=list`, {
+      signal: AbortSignal.timeout(10000),
+    });
+    if (!resp.ok) return;
+    const data = await resp.json();
+    const nodes = data.nodes || [];
+
+    let discovered = 0;
+    for (const node of nodes) {
+      if (!node.nodeUrl || node.nodeUrl === NODE_URL) continue; // skip self
+      if (node.role !== 'reader' && node.role !== 'both') continue; // only sync from readers
+      const existing = db.listPeers().find(p => p.url === node.nodeUrl);
+      if (!existing) {
+        db.upsertPeer(node.nodeUrl);
+        discovered++;
+        log.info(`Indexer: discovered peer ${node.nodeUrl} from coordinator`);
+      }
+    }
+    if (discovered > 0) log.info(`Indexer: coordinator discovery found ${discovered} new peer(s)`);
+  } catch (err) {
+    log.warn(`Indexer: coordinator discovery failed — ${err.message}`);
   }
 }
 

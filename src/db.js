@@ -50,6 +50,11 @@ db.exec(`
     status TEXT DEFAULT 'active'
   );
 
+  CREATE TABLE IF NOT EXISTS kv (
+    key TEXT PRIMARY KEY,
+    value TEXT
+  );
+
   CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
   CREATE INDEX IF NOT EXISTS idx_artworks_complete ON artworks(complete);
   CREATE INDEX IF NOT EXISTS idx_artworks_indexed ON artworks(indexed_at);
@@ -186,6 +191,19 @@ export function listPeers() {
 export function cleanStalePeers(maxAgeMs = 24 * 60 * 60 * 1000) {
   const cutoff = Date.now() - maxAgeMs;
   return stmts.stalePeers.run(cutoff);
+}
+
+// KV store — persist indexer cursors across restarts
+const kvGet = db.prepare(`SELECT value FROM kv WHERE key = ?`);
+const kvSet = db.prepare(`INSERT INTO kv (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value`);
+
+export function getKV(key) {
+  const row = kvGet.get(key);
+  return row ? row.value : null;
+}
+
+export function setKV(key, value) {
+  kvSet.run(key, value);
 }
 
 export { db };
