@@ -717,15 +717,19 @@ app.post('/sync/push', async (req, reply) => {
 
 // ─── POD (Proof of Delivery) ───
 //
-// CDN sends HMAC-signed delivery tickets after each blob serve.
-// Phase 1: HMAC-SHA256 shared secret (POD_SIGNING_KEY).
-// Phase 2: Ed25519 — CDN pubkey in Anchor POD program config PDA,
-//          on-chain verification via Ed25519 precompile.
+// Phase 1 (legacy): CDN sends HMAC-SHA256 tickets → stored locally → flushed as devnet memos.
+// Phase 2 (current): CDN sends Ed25519-signed binary tickets → stored locally →
+//                    submitted to Anchor POD program via Ed25519 precompile.
+//
+// If POD_CDN_PUBKEY is set, Phase 2 is active. Otherwise falls back to Phase 1.
 
 const POD_SIGNING_KEY = process.env.POD_SIGNING_KEY || '';
-const POD_FLUSH_INTERVAL = 5 * 60 * 1000; // 5 min batch window for devnet memos
+const POD_CDN_PUBKEY = process.env.POD_CDN_PUBKEY || ''; // hex-encoded 32-byte Ed25519 pubkey
+const POD_PROGRAM_ID = process.env.POD_PROGRAM_ID || '';
+const POD_NETWORK = process.env.POD_NETWORK || 'devnet';
+const POD_FLUSH_INTERVAL = 5 * 60 * 1000; // 5 min batch window
 
-/** Verify HMAC-SHA256 delivery ticket from CDN (timing-safe) */
+/** Verify HMAC-SHA256 delivery ticket from CDN (Phase 1 — timing-safe) */
 function verifyPodTicket(ticket) {
   if (!POD_SIGNING_KEY) return false;
   const { hash, nodeId, bytes, timestamp, hmac } = ticket;
@@ -737,69 +741,238 @@ function verifyPodTicket(ticket) {
 }
 
 // Receive signed delivery ticket from CDN
-// Auth: HMAC ticket IS the authentication — no webhook secret needed.
-// The CDN signs the ticket with POD_SIGNING_KEY, proving it's genuine.
+// Phase 2: accepts { message, signature, nonce } (Ed25519 binary)
+// Phase 1 fallback: accepts { hash, nodeId, bytes, timestamp, hmac } (HMAC)
 app.post('/pod/receipt', (req, reply) => {
-  if (!POD_SIGNING_KEY) {
-    reply.status(503);
-    return { error: 'POD not configured — set POD_SIGNING_KEY' };
+  const body = req.body;
+
+  // ── Phase 2: Ed25519 signed receipt ──
+  if (body.message && body.signature && body.nonce !== undefined) {
+    if (!POD_CDN_PUBKEY) {
+      reply.status(503);
+      return { error: 'POD Phase 2 not configured — set POD_CDN_PUBKEY' };
+    }
+
+    const msgBytes = Buffer.from(body.message);
+    const sigBytes = Buffer.from(body.signature);
+    const nonce = typeof body.nonce === 'string' ? parseInt(body.nonce) : body.nonce;
+
+    // Validate message size (93 bytes)
+    if (msgBytes.length !== 93) {
+      reply.status(400);
+      return { error: 'Invalid message size — expected 93 bytes' };
+    }
+
+    // Optional: local Ed25519 signature verification before storing
+    // (rejects bad tickets early, saves storage + on-chain submission cost)
+    try {
+      const { verify } = require('crypto');
+      const pubDer = Buffer.concat([
+        Buffer.from('302a300506032b6570032100', 'hex'), // SPKI prefix
+        Buffer.from(POD_CDN_PUBKEY, 'hex'),
+      ]);
+      const valid = verify(null, msgBytes, { key: pubDer, format: 'der', type: 'spki' }, sigBytes);
+      if (!valid) {
+        reply.status(401);
+        return { error: 'Invalid Ed25519 signature' };
+      }
+    } catch (err) {
+      app.log.warn(`POD: local signature check failed — ${err.message}`);
+      // Continue anyway — the on-chain program will reject bad sigs
+    }
+
+    db.insertPodReceiptV2({
+      nonce,
+      message: msgBytes,
+      signature: sigBytes,
+      timestamp: Date.now(),
+    });
+
+    return { ok: true, stored: true, version: 2 };
   }
 
-  const ticket = req.body;
-  if (!verifyPodTicket(ticket)) {
+  // ── Phase 1 fallback: HMAC ticket ──
+  if (!POD_SIGNING_KEY) {
+    reply.status(503);
+    return { error: 'POD not configured — set POD_SIGNING_KEY or POD_CDN_PUBKEY' };
+  }
+
+  if (!verifyPodTicket(body)) {
     reply.status(401);
     return { error: 'Invalid POD ticket — HMAC verification failed' };
   }
 
-  // Verify this ticket is for us
-  if (ticket.nodeId !== NODE_ID) {
+  if (body.nodeId !== NODE_ID) {
     reply.status(400);
     return { error: 'Ticket nodeId does not match this node' };
   }
 
-  // Reject stale tickets (>1 hour old)
-  if (Math.abs(Date.now() - ticket.timestamp) > 3600_000) {
+  if (Math.abs(Date.now() - body.timestamp) > 3600_000) {
     reply.status(400);
     return { error: 'Ticket expired' };
   }
 
   db.insertPodReceipt({
-    hash: ticket.hash,
-    nodeId: ticket.nodeId,
-    bytes: ticket.bytes,
-    timestamp: ticket.timestamp,
-    hmac: ticket.hmac,
+    hash: body.hash,
+    nodeId: body.nodeId,
+    bytes: body.bytes,
+    timestamp: body.timestamp,
+    hmac: body.hmac,
   });
 
-  return { ok: true, stored: true };
+  return { ok: true, stored: true, version: 1 };
 });
 
 // POD stats — open for debugging
 app.get('/pod/stats', (req) => {
   const ip = req.ip || 'unknown';
   if (!checkRate(ip)) return { error: 'Rate limited' };
-  return db.getPodStats();
+  return {
+    v1: db.getPodStats(),
+    v2: db.getPodStatsV2(),
+  };
 });
 
-// ─── POD devnet memo writer (periodic batch flush) ───
+// ─── POD Phase 2: Anchor program submitter (periodic batch flush) ───
 
 const NODE_WALLET_KEY = process.env.NODE_WALLET_KEY || '';
 let _podFlushTimer = null;
 
-async function flushPodReceipts() {
-  if (!NODE_WALLET_KEY) return; // no wallet = no on-chain writes
+/**
+ * Flush Phase 2 POD receipts to the Anchor program via Ed25519 precompile.
+ * Each receipt = separate transaction (Ed25519 precompile + submit_receipt).
+ */
+async function flushPodReceiptsV2() {
+  if (!NODE_WALLET_KEY || !POD_CDN_PUBKEY || !POD_PROGRAM_ID) return;
+
+  const receipts = db.getUnsubmittedReceiptsV2(5);
+  if (receipts.length === 0) return;
+
+  try {
+    const {
+      Keypair, Transaction, PublicKey, Connection,
+      Ed25519Program, SYSVAR_INSTRUCTIONS_PUBKEY,
+      SystemProgram, ComputeBudgetProgram,
+    } = await import('@solana/web3.js');
+
+    const rpcUrl = POD_NETWORK === 'mainnet'
+      ? 'https://api.mainnet-beta.solana.com'
+      : 'https://api.devnet.solana.com';
+    const conn = new Connection(rpcUrl, 'confirmed');
+    const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(NODE_WALLET_KEY)));
+    const programId = new PublicKey(POD_PROGRAM_ID);
+    const cdnPubkeyBytes = Buffer.from(POD_CDN_PUBKEY, 'hex');
+
+    // PodConfig PDA
+    const [configPDA] = PublicKey.findProgramAddressSync(
+      [Buffer.from('fd-pod-config')],
+      programId
+    );
+
+    const results = await Promise.allSettled(
+      receipts.map(async (receipt) => {
+        const msgBytes = Buffer.isBuffer(receipt.message) ? receipt.message : Buffer.from(receipt.message);
+        const sigBytes = Buffer.isBuffer(receipt.signature) ? receipt.signature : Buffer.from(receipt.signature);
+        const nonce = BigInt(receipt.nonce);
+
+        // Parse epoch from message bytes 9-13
+        const epoch = msgBytes.readUInt32LE(9);
+
+        // Derive PDAs
+        const nonceBuf = Buffer.alloc(8);
+        nonceBuf.writeBigUInt64LE(nonce);
+        const [receiptPDA] = PublicKey.findProgramAddressSync(
+          [Buffer.from('fd-pod-receipt'), nonceBuf],
+          programId
+        );
+
+        const epochBuf = Buffer.alloc(4);
+        epochBuf.writeUInt32LE(epoch);
+        const [nodeEpochPDA] = PublicKey.findProgramAddressSync(
+          [Buffer.from('fd-pod-node-epoch'), epochBuf, kp.publicKey.toBuffer()],
+          programId
+        );
+
+        // Build Ed25519 precompile instruction
+        const ed25519Ix = Ed25519Program.createInstructionWithPublicKey({
+          publicKey: cdnPubkeyBytes,
+          message: msgBytes,
+          signature: sigBytes,
+        });
+
+        // Build submit_receipt instruction manually (avoid Anchor IDL dependency)
+        // Discriminator: first 8 bytes of SHA-256("global:submit_receipt")
+        const { createHash: createSha256 } = await import('crypto');
+        const disc = createSha256('sha256')
+          .update('global:submit_receipt')
+          .digest()
+          .slice(0, 8);
+
+        // Instruction data: discriminator(8) + nonce(u64 LE, 8) + epoch(u32 LE, 4) = 20 bytes
+        const ixData = Buffer.alloc(20);
+        disc.copy(ixData, 0);
+        ixData.writeBigUInt64LE(nonce, 8);
+        ixData.writeUInt32LE(epoch, 16);
+
+        const submitIx = {
+          keys: [
+            { pubkey: configPDA, isSigner: false, isWritable: false },
+            { pubkey: receiptPDA, isSigner: false, isWritable: true },
+            { pubkey: nodeEpochPDA, isSigner: false, isWritable: true },
+            { pubkey: kp.publicKey, isSigner: true, isWritable: true },
+            { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
+            { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
+          ],
+          programId,
+          data: ixData,
+        };
+
+        const tx = new Transaction();
+        tx.add(
+          ComputeBudgetProgram.setComputeUnitLimit({ units: 250_000 }),
+          ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 5_000 }),
+          ed25519Ix,
+          submitIx,
+        );
+
+        const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+        tx.recentBlockhash = blockhash;
+        tx.feePayer = kp.publicKey;
+        tx.sign(kp);
+
+        const sig = await conn.sendRawTransaction(tx.serialize(), {
+          skipPreflight: false,
+          preflightCommitment: 'confirmed',
+        });
+        await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+
+        db.markReceiptSubmittedV2(receipt.nonce, sig);
+        return sig;
+      })
+    );
+
+    const ok = results.filter(r => r.status === 'fulfilled').length;
+    const failed = results.filter(r => r.status === 'rejected').length;
+    if (ok > 0) app.log.info(`POD v2: submitted ${ok} receipts on-chain`);
+    if (failed > 0) app.log.warn(`POD v2: ${failed} receipts failed`);
+  } catch (err) {
+    app.log.warn(`POD v2: flush failed — ${err.message}`);
+  }
+}
+
+/** Flush Phase 1 legacy POD receipts as devnet memos */
+async function flushPodReceiptsV1() {
+  if (!NODE_WALLET_KEY) return;
 
   const receipts = db.getUnsubmittedReceipts(50);
   if (receipts.length === 0) return;
 
   try {
-    // Dynamic import — @solana/web3.js may not be installed on reader-only nodes
     const { Keypair, Transaction, TransactionInstruction, PublicKey, Connection, ComputeBudgetProgram } = await import('@solana/web3.js');
     const MEMO_PROGRAM = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
     const conn = new Connection('https://api.devnet.solana.com', 'confirmed');
     const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(NODE_WALLET_KEY)));
 
-    // Aggregate receipts into POD memo
     const epoch = Math.floor(Date.now() / 3600_000);
     const agg = {};
     for (const r of receipts) {
@@ -830,19 +1003,29 @@ async function flushPodReceipts() {
     await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
 
     db.markReceiptsSubmitted(receipts.length, sig);
-    app.log.info(`POD: flushed ${receipts.length} receipts → devnet memo ${sig}`);
+    app.log.info(`POD v1: flushed ${receipts.length} receipts → devnet memo ${sig}`);
   } catch (err) {
-    app.log.warn(`POD: flush failed — ${err.message}`);
+    app.log.warn(`POD v1: flush failed — ${err.message}`);
   }
 }
 
 function startPodFlusher() {
   if (!NODE_WALLET_KEY) {
-    app.log.info('POD: no NODE_WALLET_KEY — receipts stored locally only (no devnet memos)');
+    app.log.info('POD: no NODE_WALLET_KEY — receipts stored locally only');
     return;
   }
-  app.log.info('POD: devnet memo flusher started (every 5 min)');
-  _podFlushTimer = setInterval(() => flushPodReceipts().catch(() => {}), POD_FLUSH_INTERVAL);
+
+  if (POD_CDN_PUBKEY && POD_PROGRAM_ID) {
+    app.log.info(`POD v2: Anchor program flusher started (every 5 min) → ${POD_NETWORK}`);
+  } else {
+    app.log.info('POD v1: devnet memo flusher started (every 5 min)');
+  }
+
+  _podFlushTimer = setInterval(() => {
+    // Phase 2 takes priority; Phase 1 for legacy receipts
+    flushPodReceiptsV2().catch(() => {});
+    flushPodReceiptsV1().catch(() => {});
+  }, POD_FLUSH_INTERVAL);
 }
 
 // ─── Marketplace status route ───

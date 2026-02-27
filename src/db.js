@@ -72,6 +72,19 @@ db.exec(`
   CREATE INDEX IF NOT EXISTS idx_artworks_indexed ON artworks(indexed_at);
   CREATE INDEX IF NOT EXISTS idx_pod_submitted ON pod_receipts(submitted);
   CREATE INDEX IF NOT EXISTS idx_pod_timestamp ON pod_receipts(timestamp);
+
+  CREATE TABLE IF NOT EXISTS pod_receipts_v2 (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    nonce INTEGER NOT NULL UNIQUE,
+    message BLOB NOT NULL,
+    signature BLOB NOT NULL,
+    timestamp INTEGER NOT NULL,
+    submitted INTEGER DEFAULT 0,
+    tx_sig TEXT
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_pod_v2_submitted ON pod_receipts_v2(submitted);
+  CREATE INDEX IF NOT EXISTS idx_pod_v2_nonce ON pod_receipts_v2(nonce);
 `);
 
 // Prepared statements
@@ -139,6 +152,20 @@ const stmts = {
   `),
   countPodReceipts: db.prepare(`SELECT COUNT(*) as count FROM pod_receipts`),
   countPodUnsubmitted: db.prepare(`SELECT COUNT(*) as count FROM pod_receipts WHERE submitted = 0`),
+
+  // POD v2 (Ed25519-signed receipts for Anchor program)
+  insertPodReceiptV2: db.prepare(`
+    INSERT OR IGNORE INTO pod_receipts_v2 (nonce, message, signature, timestamp)
+    VALUES (@nonce, @message, @signature, @timestamp)
+  `),
+  getUnsubmittedReceiptsV2: db.prepare(`
+    SELECT * FROM pod_receipts_v2 WHERE submitted = 0 ORDER BY timestamp ASC LIMIT ?
+  `),
+  markReceiptSubmittedV2: db.prepare(`
+    UPDATE pod_receipts_v2 SET submitted = 1, tx_sig = @txSig WHERE nonce = @nonce
+  `),
+  countPodReceiptsV2: db.prepare(`SELECT COUNT(*) as count FROM pod_receipts_v2`),
+  countPodUnsubmittedV2: db.prepare(`SELECT COUNT(*) as count FROM pod_receipts_v2 WHERE submitted = 0`),
 };
 
 // Transaction wrapper for bulk inserts
@@ -268,6 +295,32 @@ export function getPodStats() {
     perNode: stmts.getPodStats.all(),
     total: stmts.countPodReceipts.get().count,
     unsubmitted: stmts.countPodUnsubmitted.get().count,
+  };
+}
+
+// ── POD v2 receipt functions (Ed25519 signed, Anchor program submission) ──
+
+export function insertPodReceiptV2({ nonce, message, signature, timestamp }) {
+  stmts.insertPodReceiptV2.run({
+    nonce,
+    message: Buffer.isBuffer(message) ? message : Buffer.from(message),
+    signature: Buffer.isBuffer(signature) ? signature : Buffer.from(signature),
+    timestamp,
+  });
+}
+
+export function getUnsubmittedReceiptsV2(limit = 10) {
+  return stmts.getUnsubmittedReceiptsV2.all(limit);
+}
+
+export function markReceiptSubmittedV2(nonce, txSig) {
+  stmts.markReceiptSubmittedV2.run({ nonce, txSig });
+}
+
+export function getPodStatsV2() {
+  return {
+    total: stmts.countPodReceiptsV2.get().count,
+    unsubmitted: stmts.countPodUnsubmittedV2.get().count,
   };
 }
 
