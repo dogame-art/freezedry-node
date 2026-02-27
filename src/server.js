@@ -8,10 +8,10 @@ import Fastify from 'fastify';
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { createHash } from 'crypto';
+import { createHash, createHmac, timingSafeEqual } from 'crypto';
 import * as db from './db.js';
 import { startIndexer } from './indexer.js';
-import { registerWriterRoutes } from './writer/routes.js';
+// Writer routes loaded dynamically — requires @solana/web3.js which reader-only nodes may not have
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 
@@ -133,7 +133,9 @@ function requireWebhookAuth(req, reply) {
     return { error: 'WEBHOOK_SECRET not configured — node is in read-only mode' };
   }
   const authHeader = req.headers['authorization'] || '';
-  if (authHeader !== WEBHOOK_SECRET) {
+  const expected = Buffer.from(WEBHOOK_SECRET);
+  const provided = Buffer.from(authHeader);
+  if (expected.length !== provided.length || !timingSafeEqual(expected, provided)) {
     reply.status(401);
     return { error: 'Unauthorized' };
   }
@@ -146,7 +148,7 @@ const app = Fastify({ logger: true });
 app.addHook('onRequest', (req, reply, done) => {
   reply.header('Access-Control-Allow-Origin', '*');
   reply.header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-  reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key');
+  reply.header('Access-Control-Allow-Headers', 'Content-Type, Authorization, X-API-Key, X-Node-URL, X-Gossip-Origin');
   if (req.method === 'OPTIONS') {
     reply.status(204).send();
     return;
@@ -154,24 +156,42 @@ app.addHook('onRequest', (req, reply, done) => {
   done();
 });
 
+// ─── Input validation ───
+
+/** Validate hash format: sha256:{64 hex chars} */
+function isValidHash(hash) {
+  return typeof hash === 'string' && /^sha256:[0-9a-f]{64}$/.test(hash);
+}
+
+/** Validate peer URL: must be https://, no internal/private IPs */
+function isValidPeerUrl(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    if (u.protocol !== 'https:') return false;
+    const host = u.hostname;
+    // Block private/internal IPs (SSRF protection)
+    if (host === 'localhost' || host === '127.0.0.1' || host === '::1') return false;
+    if (host.startsWith('10.')) return false;
+    if (host.startsWith('192.168.')) return false;
+    if (host.startsWith('169.254.')) return false;  // link-local / cloud metadata
+    if (host.startsWith('172.') && /^172\.(1[6-9]|2\d|3[01])\./.test(host)) return false;
+    if (host.endsWith('.internal') || host.endsWith('.local')) return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 // ─── Health ───
 
 app.get('/health', () => {
-  const mem = process.memoryUsage();
   const stats = db.getStats();
-  const peers = db.listPeers();
   return {
     status: 'ok',
     service: 'freezedry-node',
-    role: ROLE,
     nodeId: NODE_ID,
-    uptime: Math.floor((Date.now() - startTime) / 1000),
-    memory: {
-      rss: (mem.rss / 1024 / 1024).toFixed(1) + ' MB',
-      heap: (mem.heapUsed / 1024 / 1024).toFixed(1) + ' MB',
-    },
-    indexed: stats,
-    peers: peers.length,
+    indexed: { artworks: stats.artworks, complete: stats.complete },
+    peers: db.listPeers().length,
   };
 });
 
@@ -180,9 +200,18 @@ app.get('/health', () => {
 app.get('/artwork/:hash', (req, reply) => {
   const ip = req.ip || 'unknown';
   if (!checkRate(ip)) { reply.status(429); return { error: 'Rate limit exceeded' }; }
+  if (!isValidHash(req.params.hash)) { reply.status(400); return { error: 'Invalid hash format' }; }
   const artwork = db.getArtwork(req.params.hash);
-  if (!artwork) return { error: 'Not found', status: 404 };
-  return artwork;
+  if (!artwork) { reply.status(404); return { error: 'Not found' }; }
+  return {
+    hash: artwork.hash,
+    chunkCount: artwork.chunk_count,
+    blobSize: artwork.blob_size,
+    width: artwork.width,
+    height: artwork.height,
+    mode: artwork.mode,
+    complete: !!artwork.complete,
+  };
 });
 
 // ─── List artworks ───
@@ -194,7 +223,18 @@ app.get('/artworks', (req, reply) => {
   const offset = parseInt(req.query.offset || '0', 10);
   const artworks = db.listArtworks(limit, offset);
   const stats = db.getStats();
-  return { artworks, total: stats.artworks };
+  return {
+    artworks: artworks.map(a => ({
+      hash: a.hash,
+      chunkCount: a.chunk_count,
+      blobSize: a.blob_size,
+      width: a.width,
+      height: a.height,
+      mode: a.mode,
+      complete: !!a.complete,
+    })),
+    total: stats.artworks,
+  };
 });
 
 // ─── Serve cached blob ───
@@ -220,15 +260,15 @@ const livenessCache = new Map();
 const LIVENESS_TTL = 5 * 60 * 1000;
 
 async function isPeerLive(nodeUrl) {
-  if (!nodeUrl) return false;
+  if (!nodeUrl || !isValidPeerUrl(nodeUrl)) return false;
 
   // Check cache first
   const cached = livenessCache.get(nodeUrl);
   if (cached && Date.now() - cached.time < LIVENESS_TTL) return cached.alive;
 
-  // Ping their /health
+  // Ping their /health (no redirects — SSRF protection)
   try {
-    const resp = await fetch(`${nodeUrl}/health`, { signal: AbortSignal.timeout(5000) });
+    const resp = await fetch(`${nodeUrl}/health`, { signal: AbortSignal.timeout(5000), redirect: 'manual' });
     const alive = resp.ok;
     livenessCache.set(nodeUrl, { alive, time: Date.now() });
     if (alive) db.upsertPeer(nodeUrl); // refresh last_seen on success
@@ -240,10 +280,13 @@ async function isPeerLive(nodeUrl) {
 }
 
 app.get('/blob/:hash', async (req, reply) => {
+  if (!isValidHash(req.params.hash)) { reply.status(400); return { error: 'Invalid hash format' }; }
   if (!BLOB_PUBLIC) {
-    // Auth bypass for trusted callers
+    // Auth bypass for trusted callers (timing-safe)
     const authHeader = req.headers['authorization'] || '';
-    const isAuthed = WEBHOOK_SECRET && authHeader === WEBHOOK_SECRET;
+    const expected = Buffer.from(WEBHOOK_SECRET || '');
+    const provided = Buffer.from(authHeader);
+    const isAuthed = WEBHOOK_SECRET && expected.length === provided.length && timingSafeEqual(expected, provided);
 
     if (!isAuthed) {
       // Must be a registered peer AND currently live
@@ -266,10 +309,16 @@ app.get('/blob/:hash', async (req, reply) => {
         return {
           error: 'Peer node not reachable — blob access requires a live node',
           hint: 'Make sure your node is running and publicly accessible',
-          checked: nodeUrl,
         };
       }
     }
+  }
+
+  // Only serve complete blobs — partial data wastes bandwidth and fails peer verification
+  const artwork = db.getArtwork(req.params.hash);
+  if (!artwork || !artwork.complete) {
+    reply.status(404);
+    return { error: artwork ? 'Blob incomplete — still indexing' : 'Blob not cached' };
   }
 
   const blob = db.getBlob(req.params.hash);
@@ -285,7 +334,8 @@ app.get('/blob/:hash', async (req, reply) => {
 
 // ─── SHA-256 verification ───
 
-app.get('/verify/:hash', (req) => {
+app.get('/verify/:hash', (req, reply) => {
+  if (!isValidHash(req.params.hash)) { reply.status(400); return { error: 'Invalid hash format' }; }
   const blob = db.getBlob(req.params.hash);
   if (!blob) return { error: 'Not cached', verified: false };
 
@@ -330,14 +380,75 @@ app.post('/ingest', async (req, reply) => {
   });
 
   const cachedCount = db.getChunkCount(body.hash);
+  const complete = cachedCount >= body.chunkCount;
+
+  // Gossip to peers when blob is complete
+  if (complete) {
+    gossipBlob(body.hash, body.chunkCount, []).catch(() => {});
+  }
+
   return {
     ok: true,
     hash: body.hash,
     cached: cachedCount,
     expected: body.chunkCount,
-    complete: cachedCount >= body.chunkCount,
+    complete,
   };
 });
+
+// ─── Gossip (epidemic blob propagation) ───
+
+const NODE_URL = process.env.NODE_URL || '';
+const GOSSIP_TIMEOUT = 10_000; // 10s per peer
+
+/**
+ * Push a complete blob to all known peers that haven't seen it yet.
+ * Fire-and-forget — failures are silent (peers will catch up via indexer).
+ * @param {string} hash - Blob hash (sha256:...)
+ * @param {number} chunkCount - Expected chunk count
+ * @param {string[]} origins - Node URLs that already have this blob (loop prevention)
+ */
+async function gossipBlob(hash, chunkCount, origins) {
+  const peers = db.listPeers();
+  const originSet = new Set(origins);
+  if (NODE_URL) originSet.add(NODE_URL);
+  const originHeader = [...originSet].join(',');
+
+  // Filter: skip self, skip nodes that already have it
+  const targets = peers.filter(p => !originSet.has(p.url));
+  if (targets.length === 0) return;
+
+  // Get blob data to send
+  const blob = db.getBlob(hash);
+  if (!blob) return;
+
+  const results = await Promise.allSettled(
+    targets.map(async (peer) => {
+      const resp = await fetch(`${peer.url}/sync/push`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Node-URL': NODE_URL,
+          'X-Gossip-Origin': originHeader,
+        },
+        body: JSON.stringify({
+          hash,
+          chunkCount,
+          data: blob.toString('base64'),
+          size: blob.length,
+        }),
+        signal: AbortSignal.timeout(GOSSIP_TIMEOUT),
+      });
+      if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+      return peer.url;
+    })
+  );
+
+  const pushed = results.filter(r => r.status === 'fulfilled').length;
+  if (pushed > 0) {
+    app.log.info(`Gossip: pushed ${hash.slice(0, 20)}... to ${pushed}/${targets.length} peer(s)`);
+  }
+}
 
 // ─── Helius Webhook (real-time push) ───
 
@@ -397,15 +508,20 @@ app.post('/webhook/helius', async (req, reply) => {
 
 /** Check if the requesting node is a registered active peer */
 function requireActivePeer(req, reply) {
-  // Check by auth header (preferred) or by IP matching a known peer URL
+  // Check by auth header (timing-safe comparison)
   const authHeader = req.headers['authorization'] || '';
-  if (WEBHOOK_SECRET && authHeader === WEBHOOK_SECRET) return true;
+  const expected = Buffer.from(WEBHOOK_SECRET || '');
+  const provided = Buffer.from(authHeader);
+  if (WEBHOOK_SECRET && expected.length === provided.length && timingSafeEqual(expected, provided)) {
+    return true;
+  }
 
-  // Check if requester's origin matches a known peer
-  const origin = req.headers['origin'] || req.headers['referer'] || '';
-  const peers = db.listPeers();
-  const isPeer = peers.some(p => origin.startsWith(p.url) || req.headers['x-node-url'] === p.url);
-  if (isPeer) return true;
+  // Check if X-Node-URL matches a known peer (liveness verified at announce time)
+  const nodeUrl = req.headers['x-node-url'] || '';
+  if (nodeUrl) {
+    const peers = db.listPeers();
+    if (peers.some(p => p.url === nodeUrl)) return true;
+  }
 
   reply.status(403);
   return false;
@@ -416,14 +532,13 @@ app.get('/sync/list', (req, reply) => {
     return { error: 'Peer sync requires active peer registration. Use /sync/announce first.' };
   }
   const limit = Math.min(parseInt(req.query.limit || '100', 10), 500);
-  const artworks = db.listArtworks(limit, 0);
+  const offset = parseInt(req.query.offset || '0', 10);
+  const artworks = db.listArtworks(limit, offset);
   return {
-    nodeId: NODE_ID,
     artworks: artworks.map(a => ({
       hash: a.hash,
       chunkCount: a.chunk_count,
-      blobSize: a.blob_size,
-      complete: a.complete,
+      complete: !!a.complete,
     })),
   };
 });
@@ -432,12 +547,16 @@ app.get('/sync/chunks/:hash', (req, reply) => {
   if (requireActivePeer(req, reply) === false) {
     return { error: 'Peer sync requires active peer registration. Use /sync/announce first.' };
   }
-  const blob = db.getBlob(req.params.hash);
-  if (!blob) {
+  if (!isValidHash(req.params.hash)) { reply.status(400); return { error: 'Invalid hash format' }; }
+
+  // Only serve complete blobs (same check as /blob/:hash)
+  const artwork = db.getArtwork(req.params.hash);
+  if (!artwork || !artwork.complete) {
     reply.status(404);
-    return { error: 'Not cached' };
+    return { error: artwork ? 'Blob incomplete' : 'Not cached' };
   }
-  // Return base64-encoded blob for peer sync
+  const blob = db.getBlob(req.params.hash);
+  if (!blob) { reply.status(404); return { error: 'Not cached' }; }
   return {
     hash: req.params.hash,
     data: blob.toString('base64'),
@@ -445,39 +564,54 @@ app.get('/sync/chunks/:hash', (req, reply) => {
   };
 });
 
-// List known peers (public — enables gossip protocol)
+// List known peers — peer-gated to prevent network enumeration
 app.get('/nodes', (req, reply) => {
   const ip = req.ip || 'unknown';
   if (!checkRate(ip)) { reply.status(429); return { error: 'Rate limit exceeded' }; }
+  if (requireActivePeer(req, reply) === false) {
+    return { error: 'Peer list requires active peer registration' };
+  }
   const peers = db.listPeers();
-  const NODE_URL = process.env.NODE_URL || '';
   return {
     nodeId: NODE_ID,
-    self: NODE_URL || null,
-    nodes: peers.map(p => ({ url: p.url, lastSeen: p.last_seen })),
+    count: peers.length,
+    nodes: peers.map(p => ({ url: p.url })),
   };
 });
 
-// Announce a peer — requires webhook secret to prevent fake registrations.
+// Announce a peer — validated via URL format check + liveness ping.
 // Bidirectional: when a peer announces, we announce back if we have NODE_URL.
 app.post('/sync/announce', async (req, reply) => {
-  const authErr = requireWebhookAuth(req, reply);
-  if (authErr) return authErr;
+  const ip = req.headers['x-real-ip'] || req.ip;
+  if (!checkRate(ip, true)) {
+    reply.status(429);
+    return { error: 'Rate limited' };
+  }
 
   const { url } = req.body || {};
-  if (!url) return { error: 'Missing url' };
+  if (!url || typeof url !== 'string') return { error: 'Missing url' };
+
+  // Block internal IPs and non-https URLs (SSRF protection)
+  if (!isValidPeerUrl(url)) {
+    reply.status(400);
+    return { error: 'Invalid peer URL — must be https:// and public IP' };
+  }
+
+  // Verify the peer is actually running before registering
+  const live = await isPeerLive(url);
+  if (!live) {
+    reply.status(400);
+    return { error: 'Peer not reachable — must be a live Freeze Dry node' };
+  }
+
   db.upsertPeer(url);
 
-  // Bidirectional: announce back to the peer
-  const NODE_URL = process.env.NODE_URL || '';
+  // Bidirectional: announce back to the peer (no auth needed — they'll liveness-check us too)
   if (NODE_URL && url !== NODE_URL) {
     try {
       await fetch(`${url}/sync/announce`, {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': WEBHOOK_SECRET,
-        },
+        headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: NODE_URL }),
         signal: AbortSignal.timeout(5000),
       });
@@ -487,13 +621,223 @@ app.post('/sync/announce', async (req, reply) => {
   return { ok: true, registered: url };
 });
 
+// ─── Gossip push receiver (peer-to-peer blob sync) ───
+
+app.post('/sync/push', async (req, reply) => {
+  if (requireActivePeer(req, reply) === false) {
+    return { error: 'Gossip push requires active peer registration. Use /sync/announce first.' };
+  }
+
+  const { hash, chunkCount, data, size } = req.body || {};
+  if (!hash || !chunkCount || !data) {
+    reply.status(400);
+    return { error: 'Missing hash, chunkCount, or data' };
+  }
+  if (!isValidHash(hash)) {
+    reply.status(400);
+    return { error: 'Invalid hash format' };
+  }
+
+  // Short-circuit: already have this blob complete
+  const existing = db.getArtwork(hash);
+  if (existing && existing.complete) {
+    return { status: 'already-complete', hash };
+  }
+
+  // Decode and verify integrity
+  const blobBuf = Buffer.from(data, 'base64');
+  const computed = 'sha256:' + createHash('sha256').update(blobBuf).digest('hex');
+  if (computed !== hash) {
+    reply.status(400);
+    return { error: 'Hash mismatch', expected: hash, computed };
+  }
+
+  // Store the blob
+  db.upsertArtwork({
+    hash,
+    chunkCount,
+    blobSize: size || blobBuf.length,
+    width: null,
+    height: null,
+    mode: 'open',
+    network: 'mainnet',
+    pointerSig: null,
+    chunks: null,
+  });
+  db.storeBlob(hash, blobBuf);
+
+  app.log.info(`Gossip: received ${hash.slice(0, 20)}... (${blobBuf.length}B) from peer`);
+
+  // Forward to remaining peers (accumulate origin list)
+  const incomingOrigins = (req.headers['x-gossip-origin'] || '').split(',').filter(Boolean);
+  const senderUrl = req.headers['x-node-url'] || '';
+  const allOrigins = [...new Set([...incomingOrigins, senderUrl].filter(Boolean))];
+  gossipBlob(hash, chunkCount, allOrigins).catch(() => {});
+
+  return { status: 'accepted', hash };
+});
+
+// ─── POD (Proof of Delivery) ───
+//
+// CDN sends HMAC-signed delivery tickets after each blob serve.
+// Phase 1: HMAC-SHA256 shared secret (POD_SIGNING_KEY).
+// Phase 2: Ed25519 — CDN pubkey in Anchor POD program config PDA,
+//          on-chain verification via Ed25519 precompile.
+
+const POD_SIGNING_KEY = process.env.POD_SIGNING_KEY || '';
+const POD_FLUSH_INTERVAL = 5 * 60 * 1000; // 5 min batch window for devnet memos
+
+/** Verify HMAC-SHA256 delivery ticket from CDN (timing-safe) */
+function verifyPodTicket(ticket) {
+  if (!POD_SIGNING_KEY) return false;
+  const { hash, nodeId, bytes, timestamp, hmac } = ticket;
+  if (!hash || !nodeId || !bytes || !timestamp || !hmac) return false;
+  const message = `${hash}|${nodeId}|${bytes}|${timestamp}`;
+  const expected = createHmac('sha256', POD_SIGNING_KEY).update(message).digest('hex');
+  if (expected.length !== hmac.length) return false;
+  return timingSafeEqual(Buffer.from(expected), Buffer.from(hmac));
+}
+
+// Receive signed delivery ticket from CDN
+app.post('/pod/receipt', (req, reply) => {
+  if (!POD_SIGNING_KEY) {
+    reply.status(503);
+    return { error: 'POD not configured — set POD_SIGNING_KEY' };
+  }
+
+  // Auth: either webhook secret or the HMAC itself proves CDN origin
+  const authErr = requireWebhookAuth(req, reply);
+  if (authErr) {
+    // Webhook auth failed — that's OK if the ticket HMAC is valid
+    // (CDN uses webhook secret as auth header, but HMAC is the real proof)
+  }
+
+  const ticket = req.body;
+  if (!verifyPodTicket(ticket)) {
+    reply.status(401);
+    return { error: 'Invalid POD ticket — HMAC verification failed' };
+  }
+
+  // Verify this ticket is for us
+  if (ticket.nodeId !== NODE_ID) {
+    reply.status(400);
+    return { error: 'Ticket nodeId does not match this node' };
+  }
+
+  // Reject stale tickets (>1 hour old)
+  if (Math.abs(Date.now() - ticket.timestamp) > 3600_000) {
+    reply.status(400);
+    return { error: 'Ticket expired' };
+  }
+
+  db.insertPodReceipt({
+    hash: ticket.hash,
+    nodeId: ticket.nodeId,
+    bytes: ticket.bytes,
+    timestamp: ticket.timestamp,
+    hmac: ticket.hmac,
+  });
+
+  return { ok: true, stored: true };
+});
+
+// POD stats — open for debugging
+app.get('/pod/stats', (req) => {
+  const ip = req.ip || 'unknown';
+  if (!checkRate(ip)) return { error: 'Rate limited' };
+  return db.getPodStats();
+});
+
+// ─── POD devnet memo writer (periodic batch flush) ───
+
+const NODE_WALLET_KEY = process.env.NODE_WALLET_KEY || '';
+let _podFlushTimer = null;
+
+async function flushPodReceipts() {
+  if (!NODE_WALLET_KEY) return; // no wallet = no on-chain writes
+
+  const receipts = db.getUnsubmittedReceipts(50);
+  if (receipts.length === 0) return;
+
+  try {
+    // Dynamic import — @solana/web3.js may not be installed on reader-only nodes
+    const { Keypair, Transaction, TransactionInstruction, PublicKey, Connection, ComputeBudgetProgram } = await import('@solana/web3.js');
+    const MEMO_PROGRAM = new PublicKey('MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr');
+    const conn = new Connection('https://api.devnet.solana.com', 'confirmed');
+    const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(NODE_WALLET_KEY)));
+
+    // Aggregate receipts into POD memo
+    const epoch = Math.floor(Date.now() / 3600_000);
+    const agg = {};
+    for (const r of receipts) {
+      if (!agg[r.node_id]) agg[r.node_id] = { count: 0, bytes: 0 };
+      agg[r.node_id].count++;
+      agg[r.node_id].bytes += r.bytes;
+    }
+    const parts = Object.entries(agg).map(([id, s]) => `${id}=${s.count}:${s.bytes}`).join('|');
+    const memo = `POD:1:${epoch}:${parts}`;
+
+    const tx = new Transaction();
+    tx.add(
+      ComputeBudgetProgram.setComputeUnitLimit({ units: 50_000 }),
+      ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1_000 }),
+      new TransactionInstruction({
+        keys: [{ pubkey: kp.publicKey, isSigner: true, isWritable: false }],
+        programId: MEMO_PROGRAM,
+        data: Buffer.from(memo),
+      }),
+    );
+
+    const { blockhash, lastValidBlockHeight } = await conn.getLatestBlockhash('confirmed');
+    tx.recentBlockhash = blockhash;
+    tx.feePayer = kp.publicKey;
+    tx.sign(kp);
+
+    const sig = await conn.sendRawTransaction(tx.serialize(), { skipPreflight: false, preflightCommitment: 'confirmed' });
+    await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
+
+    db.markReceiptsSubmitted(receipts.length, sig);
+    app.log.info(`POD: flushed ${receipts.length} receipts → devnet memo ${sig}`);
+  } catch (err) {
+    app.log.warn(`POD: flush failed — ${err.message}`);
+  }
+}
+
+function startPodFlusher() {
+  if (!NODE_WALLET_KEY) {
+    app.log.info('POD: no NODE_WALLET_KEY — receipts stored locally only (no devnet memos)');
+    return;
+  }
+  app.log.info('POD: devnet memo flusher started (every 5 min)');
+  _podFlushTimer = setInterval(() => flushPodReceipts().catch(() => {}), POD_FLUSH_INTERVAL);
+}
+
+// ─── Marketplace status route ───
+
+const MARKETPLACE_ENABLED = (process.env.MARKETPLACE_ENABLED || 'false') === 'true';
+let _claimerStatus = null;
+let _attesterStatus = null;
+
+app.get('/marketplace/status', () => {
+  return {
+    enabled: MARKETPLACE_ENABLED,
+    claimer: _claimerStatus ? _claimerStatus() : null,
+    attester: _attesterStatus ? _attesterStatus() : null,
+  };
+});
+
 // ─── Start ───
 
 async function start() {
   try {
     // Register writer routes before listening (if writer role)
     if (isWriter) {
-      registerWriterRoutes(app);
+      try {
+        const { registerWriterRoutes } = await import('./writer/routes.js');
+        registerWriterRoutes(app);
+      } catch (err) {
+        console.warn(`Writer routes unavailable (${err.message}) — running in reader-only mode`);
+      }
     }
 
     await app.listen({ port: PORT, host: '0.0.0.0' });
@@ -502,6 +846,33 @@ async function start() {
     // Start the chain indexer (if reader role)
     if (isReader) {
       startIndexer(app.log);
+    }
+
+    // Start POD devnet memo flusher (if wallet configured)
+    if (POD_SIGNING_KEY) {
+      startPodFlusher();
+    }
+
+    // Start marketplace claimer/attester (if enabled)
+    if (MARKETPLACE_ENABLED) {
+      if (isWriter) {
+        try {
+          const { startClaimer, getClaimerStatus } = await import('./writer/claimer.js');
+          startClaimer();
+          _claimerStatus = getClaimerStatus;
+        } catch (err) {
+          console.warn(`Marketplace claimer unavailable (${err.message})`);
+        }
+      }
+      if (isReader) {
+        try {
+          const { startAttester, getAttesterStatus } = await import('./reader/attester.js');
+          startAttester();
+          _attesterStatus = getAttesterStatus;
+        } catch (err) {
+          console.warn(`Marketplace attester unavailable (${err.message})`);
+        }
+      }
     }
   } catch (err) {
     app.log.error(err);

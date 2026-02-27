@@ -55,9 +55,22 @@ db.exec(`
     value TEXT
   );
 
+  CREATE TABLE IF NOT EXISTS pod_receipts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    bytes INTEGER NOT NULL,
+    timestamp INTEGER NOT NULL,
+    hmac TEXT NOT NULL,
+    submitted INTEGER DEFAULT 0,
+    memo_sig TEXT
+  );
+
   CREATE INDEX IF NOT EXISTS idx_chunks_hash ON chunks(hash);
   CREATE INDEX IF NOT EXISTS idx_artworks_complete ON artworks(complete);
   CREATE INDEX IF NOT EXISTS idx_artworks_indexed ON artworks(indexed_at);
+  CREATE INDEX IF NOT EXISTS idx_pod_submitted ON pod_receipts(submitted);
+  CREATE INDEX IF NOT EXISTS idx_pod_timestamp ON pod_receipts(timestamp);
 `);
 
 // Prepared statements
@@ -107,6 +120,24 @@ const stmts = {
 
   listPeers: db.prepare(`SELECT * FROM peers WHERE status = 'active' ORDER BY last_seen DESC`),
   stalePeers: db.prepare(`UPDATE peers SET status = 'stale' WHERE status = 'active' AND last_seen < ?`),
+
+  // POD receipts
+  insertPodReceipt: db.prepare(`
+    INSERT INTO pod_receipts (hash, node_id, bytes, timestamp, hmac)
+    VALUES (@hash, @nodeId, @bytes, @timestamp, @hmac)
+  `),
+  getUnsubmittedReceipts: db.prepare(`
+    SELECT * FROM pod_receipts WHERE submitted = 0 ORDER BY timestamp ASC LIMIT ?
+  `),
+  markReceiptsSubmitted: db.prepare(`
+    UPDATE pod_receipts SET submitted = 1, memo_sig = @memoSig WHERE id IN (SELECT id FROM pod_receipts WHERE submitted = 0 ORDER BY timestamp ASC LIMIT @limit)
+  `),
+  getPodStats: db.prepare(`
+    SELECT node_id, COUNT(*) as count, SUM(bytes) as total_bytes, COUNT(DISTINCT hash) as unique_hashes
+    FROM pod_receipts GROUP BY node_id
+  `),
+  countPodReceipts: db.prepare(`SELECT COUNT(*) as count FROM pod_receipts`),
+  countPodUnsubmitted: db.prepare(`SELECT COUNT(*) as count FROM pod_receipts WHERE submitted = 0`),
 };
 
 // Transaction wrapper for bulk inserts
@@ -175,6 +206,17 @@ export function markComplete(hash) {
   stmts.markComplete.run(hash);
 }
 
+/** Store a complete blob from peer sync — replaces any partial chain-sourced chunks. */
+export function storeBlob(hash, blobBuffer) {
+  db.transaction(() => {
+    db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash);
+    db.prepare('INSERT INTO chunks (hash, chunk_index, signature, data) VALUES (?, 0, ?, ?)').run(
+      hash, 'peer-sync', blobBuffer
+    );
+    stmts.markComplete.run(hash);
+  })();
+}
+
 export function getChunkCount(hash) {
   return stmts.getChunkCount.get(hash).count;
 }
@@ -204,6 +246,28 @@ export function getKV(key) {
 
 export function setKV(key, value) {
   kvSet.run(key, value);
+}
+
+// ── POD receipt functions ─────────────────────────────────────────────────
+
+export function insertPodReceipt({ hash, nodeId, bytes, timestamp, hmac }) {
+  stmts.insertPodReceipt.run({ hash, nodeId, bytes, timestamp, hmac });
+}
+
+export function getUnsubmittedReceipts(limit = 100) {
+  return stmts.getUnsubmittedReceipts.all(limit);
+}
+
+export function markReceiptsSubmitted(limit, memoSig) {
+  stmts.markReceiptsSubmitted.run({ limit, memoSig });
+}
+
+export function getPodStats() {
+  return {
+    perNode: stmts.getPodStats.all(),
+    total: stmts.countPodReceipts.get().count,
+    unsubmitted: stmts.countPodUnsubmitted.get().count,
+  };
 }
 
 export { db };
