@@ -152,7 +152,7 @@ const ingestArtwork = db.transaction((artwork) => {
     network: network || 'mainnet',
     indexedAt: now,
     pointerSig: pointerSig || null,
-    complete: chunks && chunks.length === chunkCount ? 1 : 0,
+    complete: 0, // never pre-set — only markComplete after SHA-256 verification
   });
 
   if (chunks) {
@@ -282,7 +282,10 @@ export function resetCorruptBlob(hash) {
 }
 
 /**
- * Verify all complete blobs against their expected SHA-256 hash.
+ * Verify all complete blobs against their expected hash.
+ * For HYD blobs: checks manifest hash at bytes 17-48 of the HYD header.
+ * For non-HYD blobs: falls back to SHA-256(entire blob).
+ * The pointer/work-record hash is the manifest hash (content hash), not SHA-256(blob).
  * Returns { verified, corrupt, missing } counts + list of corrupt hashes.
  */
 export function repairCorruptBlobs() {
@@ -299,13 +302,22 @@ export function repairCorruptBlobs() {
       continue;
     }
     const blob = Buffer.concat(rows.map(r => r.data));
-    const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
-    if (computed === hash) {
+
+    // Verify via manifest hash (HYD header bytes 17-48) or SHA-256 fallback
+    let match = false;
+    if (blob.length >= 49 && blob[0] === 0x48 && blob[1] === 0x59 && blob[2] === 0x44 && blob[3] === 0x01) {
+      const manifestHash = 'sha256:' + Buffer.from(blob.slice(17, 49)).toString('hex');
+      match = manifestHash === hash;
+    } else {
+      const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
+      match = computed === hash;
+    }
+
+    if (match) {
       verified++;
     } else {
       corrupt++;
-      corruptHashes.push({ hash, reason: 'hash-mismatch', computed: computed.slice(0, 24), blobSize: blob.length });
-      // Reset for re-index from chain
+      corruptHashes.push({ hash, reason: 'hash-mismatch', blobSize: blob.length });
       db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash);
       db.prepare('UPDATE artworks SET complete = 0 WHERE hash = ?').run(hash);
     }

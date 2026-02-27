@@ -339,15 +339,25 @@ app.get('/verify/:hash', (req, reply) => {
   const blob = db.getBlob(req.params.hash);
   if (!blob) return { error: 'Not cached', verified: false };
 
-  const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
-  const match = computed === req.params.hash;
+  // Verify via manifest hash (bytes 17-48 of HYD header), not SHA-256(entire blob).
+  // The pointer/work-record hash is the manifest hash — a content hash embedded during .hyd creation.
+  const result = { expected: req.params.hash, blobSize: blob.length };
+  const HYD_MAGIC = blob.length >= 49 && blob[0] === 0x48 && blob[1] === 0x59 && blob[2] === 0x44 && blob[3] === 0x01;
 
-  return {
-    verified: match,
-    expected: req.params.hash,
-    computed,
-    blobSize: blob.length,
-  };
+  if (HYD_MAGIC) {
+    const manifestHash = 'sha256:' + Buffer.from(blob.slice(17, 49)).toString('hex');
+    result.verified = manifestHash === req.params.hash;
+    result.manifestHash = manifestHash;
+    result.method = 'hyd-header';
+  } else {
+    // Non-HYD blob fallback: SHA-256 of entire content
+    const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
+    result.verified = computed === req.params.hash;
+    result.computed = computed;
+    result.method = 'sha256-full';
+  }
+
+  return result;
 });
 
 // ─── Blob repair — verify all blobs and re-index corrupt ones ───

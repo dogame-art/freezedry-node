@@ -460,26 +460,44 @@ async function fetchAndCacheChunks(artwork) {
     const cached = db.getChunkCount(artwork.hash);
     log.info(`Indexer: cached ${cached}/${artwork.chunk_count} chunks for ${artwork.hash.slice(0, 16)}...`);
 
-    // Verify assembled blob SHA-256 matches expected hash
+    // Verify reconstructed blob matches the manifest hash from the pointer.
+    // The pointer/work-record hash is the MANIFEST hash (bytes 17-48 of the HYD header),
+    // NOT SHA-256(entire blob). The manifest hash is embedded during .hyd creation and
+    // represents the content hash. SHA-256(blob) includes the header itself, so it differs.
     if (cached >= artwork.chunk_count) {
-      const { createHash } = await import('crypto');
       const blob = db.getBlob(artwork.hash);
       if (blob) {
-        const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
-        if (computed !== artwork.hash) {
-          // Retry cap: don't infinitely reset if chain reconstruction always fails
+        let verified = false;
+
+        // Primary verification: extract manifest hash from HYD header bytes 17-48
+        if (blob.length >= 49 && blob[0] === 0x48 && blob[1] === 0x59 && blob[2] === 0x44 && blob[3] === 0x01) {
+          const manifestHex = Buffer.from(blob.slice(17, 49)).toString('hex');
+          const manifestHash = 'sha256:' + manifestHex;
+          if (manifestHash === artwork.hash) {
+            verified = true;
+            log.info(`Indexer: blob verified — manifest hash matches for ${artwork.hash.slice(0, 16)}...`);
+          } else {
+            log.warn(`Indexer: manifest hash mismatch for ${artwork.hash.slice(0, 16)}... — header says ${manifestHash.slice(0, 24)}, expected ${artwork.hash.slice(0, 24)}`);
+          }
+        }
+
+        // Secondary verification: check blob size matches pointer's blobSize
+        if (verified && artwork.blob_size && blob.length !== artwork.blob_size) {
+          log.warn(`Indexer: size mismatch for ${artwork.hash.slice(0, 16)}... — got ${blob.length}, expected ${artwork.blob_size}`);
+          verified = false;
+        }
+
+        if (!verified) {
           const retryKey = `repair_attempts:${artwork.hash}`;
           const attempts = parseInt(db.getKV(retryKey) || '0', 10);
           if (attempts < 3) {
             db.setKV(retryKey, String(attempts + 1));
-            log.warn(`Indexer: chain-reconstructed blob SHA-256 MISMATCH for ${artwork.hash.slice(0, 16)}... — got ${computed.slice(0, 24)}. Reset attempt ${attempts + 1}/3.`);
+            log.warn(`Indexer: blob verification failed for ${artwork.hash.slice(0, 16)}... — reset attempt ${attempts + 1}/3`);
             db.resetCorruptBlob(artwork.hash);
           } else {
-            log.error(`Indexer: blob ${artwork.hash.slice(0, 16)}... failed SHA-256 after 3 chain reconstructions — possible on-chain data issue. Leaving as-is.`);
+            log.error(`Indexer: blob ${artwork.hash.slice(0, 16)}... failed verification after 3 attempts — leaving as-is`);
           }
         } else {
-          log.info(`Indexer: chain-reconstructed blob SHA-256 verified for ${artwork.hash.slice(0, 16)}...`);
-          // Clear retry counter on success
           db.setKV(`repair_attempts:${artwork.hash}`, '0');
         }
       }
@@ -497,9 +515,12 @@ async function fillChunksEnhanced(artwork) {
 
   // Paginate: Enhanced API returns max 100 per call.
   // Other artworks' chunks are interspersed — filter by hash8 prefix.
-  // Safety: max 100 pages = 10,000 txs.
-  const MAX_PAGES = 100;
+  // Large artworks with re-inscription duplicates may need 300+ pages.
+  const MAX_PAGES = 500;
   const allTxs = [];
+  // Running unique index counter — avoids O(n²) re-decoding every page
+  const earlyIndices = new Set();
+  let noProgressPages = 0; // stop if 10 consecutive pages have no new chunks
 
   for (let page = 0; page < MAX_PAGES; page++) {
     const txs = await fetchEnhancedTransactions(SERVER_WALLET, beforeSig, 100);
@@ -509,16 +530,20 @@ async function fillChunksEnhanced(artwork) {
     beforeSig = txs[txs.length - 1].signature;
     await sleep(200); // rate limit between pages
 
-    // Early exit: count v3 chunks matching THIS artwork's hash
-    let matched = 0;
-    for (const tx of allTxs) {
+    // Early exit: count UNIQUE v3 chunk indices from THIS page only
+    const prevSize = earlyIndices.size;
+    for (const tx of txs) {
       if (tx.transactionError) continue;
       const memoData = extractEnhancedMemoData(tx);
       if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
       if (!memoData.startsWith(`FD:${hash8}:`)) continue;
-      matched++;
+      const idx = parseV3Index(memoData);
+      earlyIndices.add(idx !== null ? idx : earlyIndices.size);
     }
-    if (matched >= needed) break;
+    if (earlyIndices.size >= needed) break;
+    // Stop if no new chunks found in 10 consecutive pages (past the inscription range)
+    if (earlyIndices.size === prevSize) { noProgressPages++; if (noProgressPages >= 10) break; }
+    else noProgressPages = 0;
   }
 
   if (allTxs.length === 0) return [];
@@ -527,6 +552,8 @@ async function fillChunksEnhanced(artwork) {
   // IMPORTANT: require FD:{hash8}: prefix to exclude old pre-v3 chunks from
   // earlier inscription attempts that used different payload sizes (500B vs 585B).
   // Without this, old chunks get mixed in with wrong byte boundaries → corrupt blob.
+  // Deduplicate by index: multiple inscription attempts produce duplicate v3 chunks.
+  const seenIndices = new Set();
   for (let i = allTxs.length - 1; i >= 0 && chunks.length < needed; i--) {
     const tx = allTxs[i];
     if (tx.transactionError) continue;
@@ -535,8 +562,11 @@ async function fillChunksEnhanced(artwork) {
     // REQUIRE v3 header with matching hash prefix — reject all non-v3 memos
     if (!memoData.startsWith(`FD:${hash8}:`)) continue;
     const v3Index = parseV3Index(memoData);
+    const idx = v3Index !== null ? v3Index : chunks.length;
+    if (seenIndices.has(idx)) continue; // skip duplicate index from re-inscription
+    seenIndices.add(idx);
     const stripped = stripV3Header(memoData);
-    chunks.push({ index: v3Index !== null ? v3Index : chunks.length, signature: tx.signature, data: stripped });
+    chunks.push({ index: idx, signature: tx.signature, data: stripped });
   }
   return chunks;
 }
@@ -582,6 +612,7 @@ async function fillChunksRPC(artwork) {
   }
 
   const chunks = [];
+  const seenIndices = new Set(); // deduplicate re-inscription attempts
   let concurrent = 0;
 
   for (let i = allSigs.length - 1; i >= 0 && chunks.length < needed; i--) {
@@ -602,8 +633,11 @@ async function fillChunksRPC(artwork) {
       // REQUIRE v3 header with matching hash prefix — reject all non-v3 memos
       if (!memoData.startsWith(`FD:${hash8}:`)) continue;
       const v3Index = parseV3Index(memoData);
+      const idx = v3Index !== null ? v3Index : chunks.length;
+      if (seenIndices.has(idx)) continue; // skip duplicate index from re-inscription
+      seenIndices.add(idx);
       const stripped = stripV3Header(memoData);
-      chunks.push({ index: v3Index !== null ? v3Index : chunks.length, signature: sigInfo.signature, data: stripped });
+      chunks.push({ index: idx, signature: sigInfo.signature, data: stripped });
     } catch (_) {}
   }
   return chunks;
@@ -664,16 +698,23 @@ async function fillFromPeers(artwork) {
         verified = true;
       }
 
-      // ── SHA-256 verification for ALL blobs (HYD and non-HYD) ──
-      // Always verify the blob hash matches the artwork hash.
-      // This prevents corrupt data from propagating between peers.
+      // ── Manifest hash verification for ALL blobs (HYD and non-HYD) ──
+      // HYD blobs: manifest hash at bytes 17-48 matches the pointer/work-record hash.
+      // Non-HYD blobs: fall back to SHA-256(entire blob).
       if (!verified) {
-        const computed = 'sha256:' + createHash('sha256').update(blobBuffer).digest('hex');
-        if (computed === artwork.hash) {
-          verified = true;
-          log.info(`Indexer: peer ${peer.url} blob SHA-256 verified for ${artwork.hash.slice(0, 16)}...`);
+        let hashMatch = false;
+        if (blobBuffer.length >= 49 && blobBuffer[0] === 0x48 && blobBuffer[1] === 0x59 && blobBuffer[2] === 0x44 && blobBuffer[3] === 0x01) {
+          const manifestHash = 'sha256:' + Buffer.from(blobBuffer.slice(17, 49)).toString('hex');
+          hashMatch = manifestHash === artwork.hash;
         } else {
-          log.warn(`Indexer: peer ${peer.url} SHA-256 mismatch for ${artwork.hash.slice(0, 16)}... — expected ${artwork.hash.slice(0, 24)}, got ${computed.slice(0, 24)}`);
+          const computed = 'sha256:' + createHash('sha256').update(blobBuffer).digest('hex');
+          hashMatch = computed === artwork.hash;
+        }
+        if (hashMatch) {
+          verified = true;
+          log.info(`Indexer: peer ${peer.url} blob verified for ${artwork.hash.slice(0, 16)}...`);
+        } else {
+          log.warn(`Indexer: peer ${peer.url} hash mismatch for ${artwork.hash.slice(0, 16)}...`);
           continue;
         }
       }
