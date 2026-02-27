@@ -674,12 +674,20 @@ app.post('/sync/push', async (req, reply) => {
     return { status: 'already-complete', hash };
   }
 
-  // Decode and verify integrity
+  // Decode and verify integrity — HYD blobs use manifest hash (bytes 17-48), not SHA-256(blob)
   const blobBuf = Buffer.from(data, 'base64');
-  const computed = 'sha256:' + createHash('sha256').update(blobBuf).digest('hex');
-  if (computed !== hash) {
+  let hashMatch = false;
+  const isHYD = blobBuf.length >= 49 && blobBuf[0] === 0x48 && blobBuf[1] === 0x59 && blobBuf[2] === 0x44 && blobBuf[3] === 0x01;
+  if (isHYD) {
+    const manifestHash = 'sha256:' + blobBuf.slice(17, 49).toString('hex');
+    hashMatch = manifestHash === hash;
+  } else {
+    const computed = 'sha256:' + createHash('sha256').update(blobBuf).digest('hex');
+    hashMatch = computed === hash;
+  }
+  if (!hashMatch) {
     reply.status(400);
-    return { error: 'Hash mismatch', expected: hash, computed };
+    return { error: 'Hash mismatch — blob integrity check failed', expected: hash.slice(0, 24) };
   }
 
   // Store the blob
