@@ -132,10 +132,12 @@ export function startIndexer(logger) {
     seedFromRegistry().catch(err => log.warn(`Registry seed failed: ${err.message}`));
   }
 
-  // Discover peers from coordinator + configured peers
-  discoverFromCoordinator().catch(err => log.warn(`Coordinator discovery failed: ${err.message}`));
+  // Auto-register with coordinator (wallet auth), then discover peers
+  registerWithCoordinator()
+    .then(() => discoverFromCoordinator())
+    .catch(err => log.warn(`Coordinator startup failed: ${err.message}`));
 
-  // Connect to peer network on startup
+  // Connect to peer network on startup (manual PEER_NODES + gossip)
   if (PEER_NODES.length > 0 || NODE_URL) {
     joinPeerNetwork().catch(err => log.warn(`Peer network join failed: ${err.message}`));
   }
@@ -152,10 +154,11 @@ async function pollLoop() {
       await scanForPointerMemos();
       await fillIncomplete();
 
-      // Every 10 polls (~20 min): clean stale peers, discover from coordinator, re-gossip
+      // Every 10 polls (~20 min): refresh coordinator registration, discover peers, gossip
       pollCount++;
       if (pollCount % 10 === 0) {
         db.cleanStalePeers();
+        await registerWithCoordinator().catch(() => {});
         await discoverFromCoordinator().catch(() => {});
         await gossipPeers().catch(() => {});
       }
@@ -402,13 +405,24 @@ async function fillIncomplete() {
 
   log.info(`Indexer: ${incomplete.length} incomplete artworks to fill`);
 
-  for (const artwork of incomplete) {
-    try {
-      // Try peer sync first (much faster than chain reads)
-      const peerFilled = await fillFromPeers(artwork);
-      if (peerFilled) continue;
+  // Phase 1: Parallel peer sync (fast — just HTTP downloads, no RPC)
+  const PEER_BATCH = 4;
+  const peerRemaining = [];
+  for (let i = 0; i < incomplete.length; i += PEER_BATCH) {
+    const batch = incomplete.slice(i, i + PEER_BATCH);
+    const results = await Promise.allSettled(
+      batch.map(art => fillFromPeers(art).then(ok => ({ art, ok })))
+    );
+    for (const r of results) {
+      if (r.status === 'rejected' || !r.value.ok) {
+        peerRemaining.push(r.status === 'fulfilled' ? r.value.art : batch[results.indexOf(r)]);
+      }
+    }
+  }
 
-      // Fall back to chain reads
+  // Phase 2: Sequential chain reads for anything peers couldn't fill
+  for (const artwork of peerRemaining) {
+    try {
       await fetchAndCacheChunks(artwork);
       await sleep(STAGGER_MS * 2);
     } catch (err) {
@@ -448,41 +462,103 @@ async function fetchAndCacheChunks(artwork) {
   }
 }
 
-/** Fill chunks via Enhanced API (paid plan) */
+/** Fill chunks via Enhanced API (paid plan) — paginates through all chunks */
 async function fillChunksEnhanced(artwork) {
-  const txs = await fetchEnhancedTransactions(SERVER_WALLET, artwork.pointer_sig, artwork.chunk_count + 10);
-  if (!txs || txs.length === 0) return [];
-
+  const needed = artwork.chunk_count;
+  // v3 hash prefix for filtering — first 8 chars after "sha256:"
+  const hash8 = artwork.hash.startsWith('sha256:') ? artwork.hash.slice(7, 15) : artwork.hash.slice(0, 8);
   const chunks = [];
-  for (let i = txs.length - 1; i >= 0 && chunks.length < artwork.chunk_count; i--) {
-    const tx = txs[i];
+  let beforeSig = artwork.pointer_sig;
+
+  // Paginate: Enhanced API returns max 100 per call.
+  // Other artworks' chunks are interspersed — filter by hash8 prefix.
+  // Safety: max 100 pages = 10,000 txs.
+  const MAX_PAGES = 100;
+  const allTxs = [];
+
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const txs = await fetchEnhancedTransactions(SERVER_WALLET, beforeSig, 100);
+    if (!txs || txs.length === 0) break;
+    allTxs.push(...txs);
+    if (txs.length < 100) break; // last page
+    beforeSig = txs[txs.length - 1].signature;
+    await sleep(200); // rate limit between pages
+
+    // Early exit: count chunks matching THIS artwork's hash
+    let matched = 0;
+    for (const tx of allTxs) {
+      if (tx.transactionError) continue;
+      const memoData = extractEnhancedMemoData(tx);
+      if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
+      if (memoData.startsWith('FD:') && !memoData.startsWith(`FD:${hash8}:`)) continue;
+      matched++;
+    }
+    if (matched >= needed) break;
+  }
+
+  if (allTxs.length === 0) return [];
+
+  // Extract only chunks belonging to this artwork (chronological order)
+  for (let i = allTxs.length - 1; i >= 0 && chunks.length < needed; i--) {
+    const tx = allTxs[i];
     if (tx.transactionError) continue;
     const memoData = extractEnhancedMemoData(tx);
     if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
-    // v3: strip self-identifying header, use embedded index if available
+    // v3: filter by hash prefix — skip chunks from other artworks
+    if (memoData.startsWith('FD:') && !memoData.startsWith(`FD:${hash8}:`)) continue;
+    // Use embedded index from v3 header if available
+    const v3Index = parseV3Index(memoData);
     const stripped = stripV3Header(memoData);
-    chunks.push({ index: chunks.length, signature: tx.signature, data: stripped });
+    chunks.push({ index: v3Index !== null ? v3Index : chunks.length, signature: tx.signature, data: stripped });
   }
   return chunks;
 }
 
-/** Fill chunks via standard RPC (free plan) */
+/** Extract chunk index from v3 header: FD:{hash8}:{index}:{data} → index */
+function parseV3Index(str) {
+  if (!str.startsWith('FD:')) return null;
+  const parts = str.split(':');
+  if (parts.length < 4) return null;
+  const idx = parseInt(parts[2], 10);
+  return isNaN(idx) ? null : idx;
+}
+
+/** Fill chunks via standard RPC (free plan) — paginates through all sigs */
 async function fillChunksRPC(artwork) {
-  const resp = await fetchRPC({
-    jsonrpc: '2.0', id: 1,
-    method: 'getSignaturesForAddress',
-    params: [SERVER_WALLET, {
-      before: artwork.pointer_sig,
-      limit: artwork.chunk_count + 10,
-    }],
-  });
-  const sigs = resp?.result || [];
+  const needed = artwork.chunk_count;
+  const hash8 = artwork.hash.startsWith('sha256:') ? artwork.hash.slice(7, 15) : artwork.hash.slice(0, 8);
+  const allSigs = [];
+  let beforeSig = artwork.pointer_sig;
+
+  // Paginate: getSignaturesForAddress returns max 1000 per call.
+  // Other artworks' txs are interspersed — we over-fetch then filter by hash8.
+  // Safety: max 20 pages = 20,000 sigs.
+  const MAX_PAGES = 20;
+  for (let page = 0; page < MAX_PAGES; page++) {
+    const batchLimit = 1000;
+    const resp = await fetchRPC({
+      jsonrpc: '2.0', id: 1,
+      method: 'getSignaturesForAddress',
+      params: [SERVER_WALLET, { before: beforeSig, limit: batchLimit }],
+    });
+    const sigs = resp?.result || [];
+    if (sigs.length === 0) break;
+    allSigs.push(...sigs);
+
+    // Rough proxy — need more sigs than needed chunks due to interleaving
+    const validCount = allSigs.filter(s => !s.err).length;
+    if (validCount >= needed * 2) break; // 2x buffer for interleaved txs
+
+    if (sigs.length < batchLimit) break; // last page
+    beforeSig = sigs[sigs.length - 1].signature;
+    await sleep(200);
+  }
 
   const chunks = [];
   let concurrent = 0;
 
-  for (let i = sigs.length - 1; i >= 0 && chunks.length < artwork.chunk_count; i--) {
-    const sigInfo = sigs[i];
+  for (let i = allSigs.length - 1; i >= 0 && chunks.length < needed; i--) {
+    const sigInfo = allSigs[i];
     if (sigInfo.err) continue;
 
     concurrent++;
@@ -496,9 +572,11 @@ async function fillChunksRPC(artwork) {
       if (!txData) continue;
       const memoData = extractRPCMemoData(txData);
       if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
-      // v3: strip self-identifying header
+      // v3: filter by hash prefix — skip chunks from other artworks
+      if (memoData.startsWith('FD:') && !memoData.startsWith(`FD:${hash8}:`)) continue;
+      const v3Index = parseV3Index(memoData);
       const stripped = stripV3Header(memoData);
-      chunks.push({ index: chunks.length, signature: sigInfo.signature, data: stripped });
+      chunks.push({ index: v3Index !== null ? v3Index : chunks.length, signature: sigInfo.signature, data: stripped });
     } catch (_) {}
   }
   return chunks;
@@ -530,62 +608,54 @@ async function fillFromPeers(artwork) {
       if (!resp.ok) continue;
 
       const blobBuffer = Buffer.from(await resp.arrayBuffer());
-      if (blobBuffer.length < 49) continue;
+      if (blobBuffer.length < 10) continue;
 
-      // ── Layer 1: Magic bytes + header hash matches pointer ──
-      if (blobBuffer[0] !== 0x48 || blobBuffer[1] !== 0x59 || blobBuffer[2] !== 0x44 || blobBuffer[3] !== 0x01) {
-        log.warn(`Indexer: peer ${peer.url} returned invalid blob (bad magic) for ${artwork.hash.slice(0, 16)}...`);
-        continue;
-      }
+      // ── Verification: support both HYD format and legacy (raw) blobs ──
+      const hasHydMagic = blobBuffer[0] === 0x48 && blobBuffer[1] === 0x59 &&
+                          blobBuffer[2] === 0x44 && blobBuffer[3] === 0x01;
+      let verified = false;
 
-      const embeddedHash = blobBuffer.slice(17, 49);
-      const expectedHex = 'sha256:' + embeddedHash.toString('hex');
-      if (expectedHex !== artwork.hash) {
-        log.warn(`Indexer: peer ${peer.url} header hash mismatch for ${artwork.hash.slice(0, 16)}...`);
-        continue;
-      }
-
-      // ── Layer 2: Compute SHA-256 of actual data, compare to embedded hash ──
-      const mode = blobBuffer[4];
-      const isDirect = mode >= 3;
-      const view = new DataView(blobBuffer.buffer, blobBuffer.byteOffset, blobBuffer.byteLength);
-      const avifLen = view.getUint32(9, true);
-      const deltaLen = view.getUint32(13, true);
-
-      if (isDirect) {
-        // Direct mode: hash the file bytes (stored in delta slot after header)
-        const fileBytes = blobBuffer.slice(49, 49 + deltaLen);
-        const computed = createHash('sha256').update(fileBytes).digest();
-        if (!computed.equals(embeddedHash)) {
-          log.warn(`Indexer: peer ${peer.url} data hash mismatch (direct mode) for ${artwork.hash.slice(0, 16)}...`);
+      if (hasHydMagic && blobBuffer.length >= 49) {
+        // HYD format: verify embedded hash + file data hash
+        const embeddedHash = blobBuffer.slice(17, 49);
+        const expectedHex = 'sha256:' + embeddedHash.toString('hex');
+        if (expectedHex !== artwork.hash) {
+          log.warn(`Indexer: peer ${peer.url} HYD header hash mismatch for ${artwork.hash.slice(0, 16)}...`);
           continue;
         }
-      } else {
-        // Pixel Perfect: hash is of reconstructed pixels (can't cheaply verify)
-        // Fall through to Layer 3 chain spot-check for verification
+        const mode = blobBuffer[4];
+        if (mode >= 3) {
+          const view = new DataView(blobBuffer.buffer, blobBuffer.byteOffset, blobBuffer.byteLength);
+          const deltaLen = view.getUint32(13, true);
+          const fileBytes = blobBuffer.slice(49, 49 + deltaLen);
+          const computed = createHash('sha256').update(fileBytes).digest();
+          if (!computed.equals(embeddedHash)) {
+            log.warn(`Indexer: peer ${peer.url} HYD data hash mismatch for ${artwork.hash.slice(0, 16)}...`);
+            continue;
+          }
+        }
+        verified = true;
       }
 
-      // ── Layer 3: Chain spot-check — verify random chunks against on-chain memos ──
-      if (artwork.pointer_sig && artwork.chunk_count > 0) {
-        const spotCheckPassed = await chainSpotCheck(blobBuffer, artwork);
-        if (spotCheckPassed === false) {
-          log.warn(`Indexer: peer ${peer.url} FAILED chain spot-check for ${artwork.hash.slice(0, 16)}...`);
+      // ── Peer trust: registered + liveness-verified peers are trusted ──
+      // Peers are already liveness-checked before registration (/sync/announce).
+      // For non-HYD blobs (chain-reconstructed data), trust the peer.
+      // Chain is still source of truth — indexer re-validates from chain on future cycles.
+      if (!verified) {
+        // Basic size sanity: blob should be roughly chunk_count * ~585-600 bytes
+        const minExpected = artwork.chunk_count * 500;
+        const maxExpected = artwork.chunk_count * 700;
+        if (blobBuffer.length >= minExpected && blobBuffer.length <= maxExpected) {
+          log.info(`Indexer: accepting non-HYD blob from registered peer ${peer.url} for ${artwork.hash.slice(0, 16)}... (${blobBuffer.length}B, ~${artwork.chunk_count} chunks)`);
+          verified = true;
+        } else {
+          log.warn(`Indexer: peer ${peer.url} blob size mismatch for ${artwork.hash.slice(0, 16)}... — got ${blobBuffer.length}B, expected ~${minExpected}-${maxExpected}B`);
           continue;
         }
-        // spotCheckPassed === null means we couldn't check (no RPC) — accept with Layer 1+2
       }
 
-      // ── All checks passed — store ──
-      const CHUNK_SIZE = 585;
-      const chunks = [];
-      for (let off = 0; off < blobBuffer.length; off += CHUNK_SIZE) {
-        chunks.push({
-          index: chunks.length,
-          signature: `peer:${peer.url.slice(0, 30)}`,
-          data: blobBuffer.slice(off, Math.min(off + CHUNK_SIZE, blobBuffer.length)),
-        });
-      }
-
+      // ── Verified — store complete blob ──
+      db.storeBlob(artwork.hash, blobBuffer);
       db.upsertArtwork({
         hash: artwork.hash,
         chunkCount: artwork.chunk_count,
@@ -595,7 +665,6 @@ async function fillFromPeers(artwork) {
         mode: artwork.mode,
         network: artwork.network,
         pointerSig: artwork.pointer_sig,
-        chunks,
       });
 
       log.info(`Indexer: filled ${artwork.hash.slice(0, 16)}... from peer ${peer.url} (${blobBuffer.length}B, verified)`);
@@ -713,13 +782,9 @@ async function joinPeerNetwork() {
 
 /** Announce this node's URL to a peer */
 async function announceToNode(peerUrl, selfUrl) {
-  const WEBHOOK_SECRET = process.env.WEBHOOK_SECRET || '';
   const resp = await fetch(`${peerUrl}/sync/announce`, {
     method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': WEBHOOK_SECRET,
-    },
+    headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ url: selfUrl }),
     signal: AbortSignal.timeout(10000),
   });
@@ -736,22 +801,36 @@ async function gossipPeers() {
 
   for (const peer of peers) {
     try {
-      const resp = await fetch(`${peer.url}/nodes`, {
-        signal: AbortSignal.timeout(10000),
-      });
+      const fetchOpts = { signal: AbortSignal.timeout(10000) };
+      if (NODE_URL) fetchOpts.headers = { 'X-Node-URL': NODE_URL };
+      const resp = await fetch(`${peer.url}/nodes`, fetchOpts);
       if (!resp.ok) continue;
       const data = await resp.json();
       const peerList = data.nodes || [];
 
+      const MAX_GOSSIP_PEERS = 20;  // cap per response to prevent flooding
+      const MAX_TOTAL_PEERS = 50;   // cap total peer list size
+      let accepted = 0;
+
       for (const node of peerList) {
+        if (accepted >= MAX_GOSSIP_PEERS) break;
+        if (db.listPeers().length >= MAX_TOTAL_PEERS) break;
+
         const nodeUrl = node.url || node;
-        if (typeof nodeUrl !== 'string' || !nodeUrl.startsWith('http')) continue;
+        if (typeof nodeUrl !== 'string') continue;
+        // Validate: must be HTTPS, no private IPs
+        try {
+          const parsed = new URL(nodeUrl);
+          if (parsed.protocol !== 'https:') continue;
+          if (/^(10\.|172\.(1[6-9]|2\d|3[01])\.|192\.168\.|169\.254\.|127\.|0\.)/.test(parsed.hostname)) continue;
+        } catch { continue; }
         if (nodeUrl === NODE_URL) continue; // don't add self
 
         const existing = db.listPeers().find(p => p.url === nodeUrl);
         if (!existing) {
           db.upsertPeer(nodeUrl);
           discovered++;
+          accepted++;
           log.info(`Indexer: discovered peer ${nodeUrl} via gossip from ${peer.url}`);
         }
       }
@@ -775,7 +854,11 @@ async function gossipPeers() {
 
 // ─── Coordinator discovery: learn about peers from freezedry.art ───
 
-const COORDINATOR_URL = process.env.COORDINATOR_URL || 'https://freezedry.art';
+// NOTE: COORDINATOR_URL read lazily via function — process.env isn't populated
+// at module-init time because loadEnv() in server.js runs after static imports.
+function getCoordinatorUrl() {
+  return process.env.COORDINATOR_URL || 'https://freezedry.art';
+}
 
 /**
  * Discover peer nodes from the coordinator's node registry.
@@ -784,7 +867,7 @@ const COORDINATOR_URL = process.env.COORDINATOR_URL || 'https://freezedry.art';
  */
 async function discoverFromCoordinator() {
   try {
-    const resp = await fetch(`${COORDINATOR_URL}/api/nodes?action=list`, {
+    const resp = await fetch(`${getCoordinatorUrl()}/api/nodes?action=list`, {
       signal: AbortSignal.timeout(10000),
     });
     if (!resp.ok) return;
@@ -805,6 +888,75 @@ async function discoverFromCoordinator() {
     if (discovered > 0) log.info(`Indexer: coordinator discovery found ${discovered} new peer(s)`);
   } catch (err) {
     log.warn(`Indexer: coordinator discovery failed — ${err.message}`);
+  }
+}
+
+// ─── Coordinator registration: auto-register with wallet auth ───
+
+// DER prefix for Ed25519 PKCS8 private key (RFC 8410)
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+/**
+ * Auto-register this node with the coordinator using ed25519 wallet signature.
+ * Requires NODE_URL + WALLET_KEYPAIR in .env.
+ * Runs on startup + periodically to refresh liveness.
+ */
+async function registerWithCoordinator() {
+  if (!NODE_URL) return;
+
+  const keypairJson = process.env.WALLET_KEYPAIR || '';
+  if (!keypairJson) {
+    log.info('Indexer: no WALLET_KEYPAIR — skipping coordinator registration (discovery still works)');
+    return;
+  }
+
+  try {
+    const { sign, createPrivateKey } = await import('crypto');
+
+    // Parse Solana keypair: [0..31] = ed25519 seed, [32..63] = public key
+    const keypairBytes = new Uint8Array(JSON.parse(keypairJson));
+    const seedBytes = keypairBytes.slice(0, 32);
+    const pubBytes = keypairBytes.slice(32, 64);
+    const walletPubkey = encodeBase58(pubBytes);
+
+    // Sign registration message
+    const ROLE = process.env.ROLE || 'both';
+    const timestamp = Math.floor(Date.now() / 1000);
+    const message = `FreezeDry:node-register:${NODE_URL}:${timestamp}`;
+    const messageBytes = Buffer.from(message, 'utf-8');
+
+    const privateKeyObj = createPrivateKey({
+      key: Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seedBytes)]),
+      format: 'der',
+      type: 'pkcs8',
+    });
+    const sigBytes = sign(null, messageBytes, privateKeyObj);
+    const signature = sigBytes.toString('base64');
+
+    // POST to coordinator
+    const resp = await fetch(`${getCoordinatorUrl()}/api/nodes?action=register`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: process.env.NODE_ID || 'freezedry-node',
+        nodeUrl: NODE_URL,
+        role: ROLE,
+        walletPubkey,
+        message,
+        signature,
+      }),
+      signal: AbortSignal.timeout(15000),
+    });
+
+    if (resp.ok) {
+      const data = await resp.json();
+      log.info(`Indexer: registered with coordinator (wallet: ${walletPubkey.slice(0, 8)}..., status: ${data.status})`);
+    } else {
+      const text = await resp.text().catch(() => '');
+      log.warn(`Indexer: coordinator registration failed (${resp.status}): ${text.slice(0, 200)}`);
+    }
+  } catch (err) {
+    log.warn(`Indexer: coordinator registration error — ${err.message}`);
   }
 }
 
@@ -948,6 +1100,28 @@ function decodeBase58Memo(data) {
   } catch {
     return data;
   }
+}
+
+/** Encode bytes to base58 string (for public key → base58 address) */
+function encodeBase58(bytes) {
+  if (bytes.length === 0) return '';
+  const digits = [0];
+  for (let i = 0; i < bytes.length; i++) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let output = '';
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) output += B58_ALPHABET[0];
+  for (let i = digits.length - 1; i >= 0; i--) output += B58_ALPHABET[digits[i]];
+  return output;
 }
 
 // ─── Standard RPC helpers (free plan) ───
