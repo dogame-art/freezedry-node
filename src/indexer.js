@@ -509,13 +509,13 @@ async function fillChunksEnhanced(artwork) {
     beforeSig = txs[txs.length - 1].signature;
     await sleep(200); // rate limit between pages
 
-    // Early exit: count chunks matching THIS artwork's hash
+    // Early exit: count v3 chunks matching THIS artwork's hash
     let matched = 0;
     for (const tx of allTxs) {
       if (tx.transactionError) continue;
       const memoData = extractEnhancedMemoData(tx);
       if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
-      if (memoData.startsWith('FD:') && !memoData.startsWith(`FD:${hash8}:`)) continue;
+      if (!memoData.startsWith(`FD:${hash8}:`)) continue;
       matched++;
     }
     if (matched >= needed) break;
@@ -523,15 +523,17 @@ async function fillChunksEnhanced(artwork) {
 
   if (allTxs.length === 0) return [];
 
-  // Extract only chunks belonging to this artwork (chronological order)
+  // Extract only v3 chunks belonging to this artwork (chronological order).
+  // IMPORTANT: require FD:{hash8}: prefix to exclude old pre-v3 chunks from
+  // earlier inscription attempts that used different payload sizes (500B vs 585B).
+  // Without this, old chunks get mixed in with wrong byte boundaries → corrupt blob.
   for (let i = allTxs.length - 1; i >= 0 && chunks.length < needed; i--) {
     const tx = allTxs[i];
     if (tx.transactionError) continue;
     const memoData = extractEnhancedMemoData(tx);
     if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
-    // v3: filter by hash prefix — skip chunks from other artworks
-    if (memoData.startsWith('FD:') && !memoData.startsWith(`FD:${hash8}:`)) continue;
-    // Use embedded index from v3 header if available
+    // REQUIRE v3 header with matching hash prefix — reject all non-v3 memos
+    if (!memoData.startsWith(`FD:${hash8}:`)) continue;
     const v3Index = parseV3Index(memoData);
     const stripped = stripV3Header(memoData);
     chunks.push({ index: v3Index !== null ? v3Index : chunks.length, signature: tx.signature, data: stripped });
@@ -597,8 +599,8 @@ async function fillChunksRPC(artwork) {
       if (!txData) continue;
       const memoData = extractRPCMemoData(txData);
       if (!memoData || memoData.startsWith('FREEZEDRY:')) continue;
-      // v3: filter by hash prefix — skip chunks from other artworks
-      if (memoData.startsWith('FD:') && !memoData.startsWith(`FD:${hash8}:`)) continue;
+      // REQUIRE v3 header with matching hash prefix — reject all non-v3 memos
+      if (!memoData.startsWith(`FD:${hash8}:`)) continue;
       const v3Index = parseV3Index(memoData);
       const stripped = stripV3Header(memoData);
       chunks.push({ index: v3Index !== null ? v3Index : chunks.length, signature: sigInfo.signature, data: stripped });
