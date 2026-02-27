@@ -699,17 +699,12 @@ function verifyPodTicket(ticket) {
 }
 
 // Receive signed delivery ticket from CDN
+// Auth: HMAC ticket IS the authentication — no webhook secret needed.
+// The CDN signs the ticket with POD_SIGNING_KEY, proving it's genuine.
 app.post('/pod/receipt', (req, reply) => {
   if (!POD_SIGNING_KEY) {
     reply.status(503);
     return { error: 'POD not configured — set POD_SIGNING_KEY' };
-  }
-
-  // Auth: either webhook secret or the HMAC itself proves CDN origin
-  const authErr = requireWebhookAuth(req, reply);
-  if (authErr) {
-    // Webhook auth failed — that's OK if the ticket HMAC is valid
-    // (CDN uses webhook secret as auth header, but HMAC is the real proof)
   }
 
   const ticket = req.body;
