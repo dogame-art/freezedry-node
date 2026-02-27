@@ -350,6 +350,26 @@ app.get('/verify/:hash', (req, reply) => {
   };
 });
 
+// ─── Blob repair — verify all blobs and re-index corrupt ones ───
+
+app.get('/repair', async (req, reply) => {
+  // Auth: webhook secret required (destructive — resets corrupt blobs)
+  const authErr = requireWebhookAuth(req, reply);
+  if (authErr) return authErr;
+
+  app.log.info('Repair: starting blob verification scan...');
+  const result = db.repairCorruptBlobs();
+  app.log.info(`Repair: ${result.verified} verified, ${result.corrupt} corrupt (reset), ${result.missing} missing — total ${result.total}`);
+
+  return {
+    ok: true,
+    ...result,
+    message: result.corrupt > 0
+      ? `Reset ${result.corrupt} corrupt blob(s) for re-index from chain. Next indexer cycle will refetch.`
+      : 'All blobs verified — no corruption found.',
+  };
+});
+
 // ─── Ingest (Vercel push or peer sync) — requires webhook secret ───
 
 app.post('/ingest', async (req, reply) => {

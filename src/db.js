@@ -4,6 +4,7 @@
  */
 
 import Database from 'better-sqlite3';
+import { createHash } from 'crypto';
 import { existsSync, mkdirSync } from 'fs';
 import { dirname, join } from 'path';
 import { fileURLToPath } from 'url';
@@ -268,6 +269,49 @@ export function getPodStats() {
     total: stmts.countPodReceipts.get().count,
     unsubmitted: stmts.countPodUnsubmitted.get().count,
   };
+}
+
+// ── Blob repair functions ─────────────────────────────────────────────────
+
+/** Reset a corrupt blob so the indexer re-fetches it from chain. */
+export function resetCorruptBlob(hash) {
+  db.transaction(() => {
+    db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash);
+    db.prepare('UPDATE artworks SET complete = 0 WHERE hash = ?').run(hash);
+  })();
+}
+
+/**
+ * Verify all complete blobs against their expected SHA-256 hash.
+ * Returns { verified, corrupt, missing } counts + list of corrupt hashes.
+ */
+export function repairCorruptBlobs() {
+  const complete = db.prepare('SELECT hash FROM artworks WHERE complete = 1').all();
+  let verified = 0, corrupt = 0, missing = 0;
+  const corruptHashes = [];
+
+  for (const { hash } of complete) {
+    const rows = stmts.getBlob.all(hash);
+    if (rows.length === 0) {
+      missing++;
+      db.prepare('UPDATE artworks SET complete = 0 WHERE hash = ?').run(hash);
+      corruptHashes.push({ hash, reason: 'missing-chunks' });
+      continue;
+    }
+    const blob = Buffer.concat(rows.map(r => r.data));
+    const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
+    if (computed === hash) {
+      verified++;
+    } else {
+      corrupt++;
+      corruptHashes.push({ hash, reason: 'hash-mismatch', computed: computed.slice(0, 24), blobSize: blob.length });
+      // Reset for re-index from chain
+      db.prepare('DELETE FROM chunks WHERE hash = ?').run(hash);
+      db.prepare('UPDATE artworks SET complete = 0 WHERE hash = ?').run(hash);
+    }
+  }
+
+  return { verified, corrupt, missing, total: complete.length, corruptHashes };
 }
 
 export { db };

@@ -459,6 +459,31 @@ async function fetchAndCacheChunks(artwork) {
 
     const cached = db.getChunkCount(artwork.hash);
     log.info(`Indexer: cached ${cached}/${artwork.chunk_count} chunks for ${artwork.hash.slice(0, 16)}...`);
+
+    // Verify assembled blob SHA-256 matches expected hash
+    if (cached >= artwork.chunk_count) {
+      const { createHash } = await import('crypto');
+      const blob = db.getBlob(artwork.hash);
+      if (blob) {
+        const computed = 'sha256:' + createHash('sha256').update(blob).digest('hex');
+        if (computed !== artwork.hash) {
+          // Retry cap: don't infinitely reset if chain reconstruction always fails
+          const retryKey = `repair_attempts:${artwork.hash}`;
+          const attempts = parseInt(db.getKV(retryKey) || '0', 10);
+          if (attempts < 3) {
+            db.setKV(retryKey, String(attempts + 1));
+            log.warn(`Indexer: chain-reconstructed blob SHA-256 MISMATCH for ${artwork.hash.slice(0, 16)}... — got ${computed.slice(0, 24)}. Reset attempt ${attempts + 1}/3.`);
+            db.resetCorruptBlob(artwork.hash);
+          } else {
+            log.error(`Indexer: blob ${artwork.hash.slice(0, 16)}... failed SHA-256 after 3 chain reconstructions — possible on-chain data issue. Leaving as-is.`);
+          }
+        } else {
+          log.info(`Indexer: chain-reconstructed blob SHA-256 verified for ${artwork.hash.slice(0, 16)}...`);
+          // Clear retry counter on success
+          db.setKV(`repair_attempts:${artwork.hash}`, '0');
+        }
+      }
+    }
   }
 }
 
@@ -637,19 +662,16 @@ async function fillFromPeers(artwork) {
         verified = true;
       }
 
-      // ── Peer trust: registered + liveness-verified peers are trusted ──
-      // Peers are already liveness-checked before registration (/sync/announce).
-      // For non-HYD blobs (chain-reconstructed data), trust the peer.
-      // Chain is still source of truth — indexer re-validates from chain on future cycles.
+      // ── SHA-256 verification for ALL blobs (HYD and non-HYD) ──
+      // Always verify the blob hash matches the artwork hash.
+      // This prevents corrupt data from propagating between peers.
       if (!verified) {
-        // Basic size sanity: blob should be roughly chunk_count * ~585-600 bytes
-        const minExpected = artwork.chunk_count * 500;
-        const maxExpected = artwork.chunk_count * 700;
-        if (blobBuffer.length >= minExpected && blobBuffer.length <= maxExpected) {
-          log.info(`Indexer: accepting non-HYD blob from registered peer ${peer.url} for ${artwork.hash.slice(0, 16)}... (${blobBuffer.length}B, ~${artwork.chunk_count} chunks)`);
+        const computed = 'sha256:' + createHash('sha256').update(blobBuffer).digest('hex');
+        if (computed === artwork.hash) {
           verified = true;
+          log.info(`Indexer: peer ${peer.url} blob SHA-256 verified for ${artwork.hash.slice(0, 16)}...`);
         } else {
-          log.warn(`Indexer: peer ${peer.url} blob size mismatch for ${artwork.hash.slice(0, 16)}... — got ${blobBuffer.length}B, expected ~${minExpected}-${maxExpected}B`);
+          log.warn(`Indexer: peer ${peer.url} SHA-256 mismatch for ${artwork.hash.slice(0, 16)}... — expected ${artwork.hash.slice(0, 24)}, got ${computed.slice(0, 24)}`);
           continue;
         }
       }
