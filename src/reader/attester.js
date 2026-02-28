@@ -17,7 +17,7 @@ import { getServerKeypair } from '../wallet.js';
 import {
   JOBS_PROGRAM_ID, REGISTRY_PROGRAM_ID,
   JOB_DISC, deriveConfigPDA, deriveNodePDA, deriveAttestationPDA,
-  parseJobAccount, buildAttestIx, buildSignedTx,
+  parseJobAccount, parseConfigAccount, buildAttestIx, buildReleasePaymentIx, buildSignedTx,
 } from '../chain/tx-builder.js';
 import * as db from '../db.js';
 
@@ -171,6 +171,44 @@ async function attestJob(job, isValid) {
   return sig;
 }
 
+/**
+ * After attestation, check if quorum is met and auto-release payment.
+ * release_payment is permissionless — any signer can call it once quorum is reached.
+ */
+async function tryReleasePayment(job) {
+  const conn = getConnection();
+  const keypair = getServerKeypair();
+
+  // Re-read job to get fresh attestation_count
+  const info = await conn.getAccountInfo(job.address);
+  if (!info) return;
+  const freshJob = parseJobAccount(job.address, info.data);
+  if (!freshJob || freshJob.status !== 'submitted') return;
+
+  // Read config for min_attestations + treasury
+  const [configPDA] = deriveConfigPDA();
+  const configInfo = await conn.getAccountInfo(configPDA);
+  if (!configInfo) return;
+  const config = parseConfigAccount(configPDA, configInfo.data);
+  if (!config) return;
+
+  if (freshJob.attestationCount < config.minAttestations) return;
+
+  // Quorum met — release payment
+  const ix = buildReleasePaymentIx(
+    job.address, configPDA,
+    freshJob.writer,         // inscriber gets their share
+    config.treasury,         // treasury
+    freshJob.referrer,       // referrer
+    keypair.publicKey,       // signer (permissionless)
+  );
+
+  const blockhash = (await rpcCall('getLatestBlockhash', [{ commitment: 'confirmed' }])).value.blockhash;
+  const txBase64 = buildSignedTx(ix, blockhash, keypair);
+  const sig = await sendAndConfirm(txBase64);
+  console.log(`[Attester] Auto-released payment for job #${freshJob.jobId} — tx: ${sig}`);
+}
+
 // ── Main polling loop ────────────────────────────────────────────────────────
 
 async function pollAndAttest() {
@@ -204,6 +242,16 @@ async function pollAndAttest() {
       // Attest
       try {
         await attestJob(job, isValid);
+
+        // After successful attestation, try to release payment if quorum met
+        try {
+          await tryReleasePayment(job);
+        } catch (releaseErr) {
+          // Non-fatal — release may have already happened or will be retried
+          if (!releaseErr.message.includes('already')) {
+            console.log(`[Attester] Auto-release skipped for job #${job.jobId}: ${releaseErr.message}`);
+          }
+        }
       } catch (err) {
         // AlreadyAttested error means PDA exists — mark and move on
         if (err.message.includes('already in use') || err.message.includes('AlreadyAttested')) {

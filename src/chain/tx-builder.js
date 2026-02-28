@@ -26,10 +26,11 @@ export const REGISTRY_PROGRAM_ID = new PublicKey(
 
 // ── Instruction discriminators (from freezedry_jobs IDL) ─────────────────────
 
-export const IX_CLAIM_JOB      = Buffer.from([9, 160, 5, 231, 116, 123, 198, 14]);
-export const IX_SUBMIT_RECEIPT = Buffer.from([172, 84, 119, 35, 195, 154, 214, 176]);
-export const IX_ATTEST         = Buffer.from([83, 148, 120, 119, 144, 139, 117, 160]);
-export const IX_CREATE_JOB     = Buffer.from([178, 130, 217, 110, 100, 27, 82, 119]);
+export const IX_CLAIM_JOB        = Buffer.from([9, 160, 5, 231, 116, 123, 198, 14]);
+export const IX_SUBMIT_RECEIPT   = Buffer.from([172, 84, 119, 35, 195, 154, 214, 176]);
+export const IX_ATTEST           = Buffer.from([83, 148, 120, 119, 144, 139, 117, 160]);
+export const IX_CREATE_JOB       = Buffer.from([178, 130, 217, 110, 100, 27, 82, 119]);
+export const IX_RELEASE_PAYMENT  = Buffer.from([24, 34, 191, 86, 145, 160, 183, 233]);
 
 // ── Account discriminators ───────────────────────────────────────────────────
 
@@ -109,13 +110,15 @@ export function parseJobAccount(pubkey, data) {
   if (sigLen > 256 || o + sigLen > data.length) return null;
   const pointerSig = data.subarray(o, o + sigLen).toString('utf8'); o += sigLen;
 
-  const bump = data[o];
+  const bump = data[o]; o += 1;
+
+  const referrer = new PublicKey(data.subarray(o, o + 32));
 
   return {
     address: pubkey, jobId, creator, writer,
     contentHash, chunkCount, escrowLamports, status,
     createdAt, claimedAt, submittedAt, completedAt,
-    attestationCount, pointerSig, bump,
+    attestationCount, pointerSig, bump, referrer,
   };
 }
 
@@ -127,9 +130,10 @@ export function parseConfigAccount(pubkey, data) {
   const authority = new PublicKey(data.subarray(o, o + 32)); o += 32;
   const treasury = new PublicKey(data.subarray(o, o + 32)); o += 32;
   const registryProgram = new PublicKey(data.subarray(o, o + 32)); o += 32;
-  const writerFeeBps = data.readUInt16LE(o); o += 2;
-  const nodePoolFeeBps = data.readUInt16LE(o); o += 2;
+  const inscriberFeeBps = data.readUInt16LE(o); o += 2;
+  const indexerFeeBps = data.readUInt16LE(o); o += 2;
   const treasuryFeeBps = data.readUInt16LE(o); o += 2;
+  const referralFeeBps = data.readUInt16LE(o); o += 2;
   const minAttestations = data[o]; o += 1;
   const jobExpirySeconds = Number(data.readBigInt64LE(o)); o += 8;
   const totalJobsCreated = Number(data.readBigUInt64LE(o)); o += 8;
@@ -138,7 +142,7 @@ export function parseConfigAccount(pubkey, data) {
 
   return {
     address: pubkey, authority, treasury, registryProgram,
-    writerFeeBps, nodePoolFeeBps, treasuryFeeBps,
+    inscriberFeeBps, indexerFeeBps, treasuryFeeBps, referralFeeBps,
     minAttestations, jobExpirySeconds,
     totalJobsCreated, totalJobsCompleted, bump,
   };
@@ -303,11 +307,11 @@ export function buildAttestIx(jobPDA, configPDA, attestPDA, nodePDA, readerPubke
 /**
  * Build create_job instruction.
  * Accounts: config (writable), job (writable), creator (signer, writable), system_program
- * Args: content_hash (string), chunk_count (u32), escrow_amount (u64)
+ * Args: content_hash (string), chunk_count (u32), escrow_amount (u64), referrer (Pubkey)
  */
-export function buildCreateJobIx(configPDA, jobPDA, creatorPubkey, contentHash, chunkCount, escrowAmount) {
+export function buildCreateJobIx(configPDA, jobPDA, creatorPubkey, contentHash, chunkCount, escrowAmount, referrerPubkey) {
   const hashBytes = Buffer.from(contentHash, 'utf8');
-  const data = Buffer.alloc(8 + 4 + hashBytes.length + 4 + 8);
+  const data = Buffer.alloc(8 + 4 + hashBytes.length + 4 + 8 + 32);
   let off = 0;
   IX_CREATE_JOB.copy(data, off); off += 8;
   // String: 4-byte LE length + UTF-8
@@ -316,7 +320,9 @@ export function buildCreateJobIx(configPDA, jobPDA, creatorPubkey, contentHash, 
   // u32 chunk_count
   data.writeUInt32LE(chunkCount, off); off += 4;
   // u64 escrow_amount
-  data.writeBigUInt64LE(BigInt(escrowAmount), off);
+  data.writeBigUInt64LE(BigInt(escrowAmount), off); off += 8;
+  // Pubkey referrer (32 bytes)
+  referrerPubkey.toBuffer().copy(data, off);
 
   return new TransactionInstruction({
     programId: JOBS_PROGRAM_ID,
@@ -327,6 +333,26 @@ export function buildCreateJobIx(configPDA, jobPDA, creatorPubkey, contentHash, 
       { pubkey: SystemProgram.programId, isSigner: false, isWritable: false },
     ],
     data,
+  });
+}
+
+/**
+ * Build release_payment instruction (permissionless).
+ * Accounts: job (writable), config (writable), inscriber (writable), treasury (writable), referrer (writable), signer
+ * No args — just the discriminator.
+ */
+export function buildReleasePaymentIx(jobPDA, configPDA, inscriberPubkey, treasuryPubkey, referrerPubkey, signerPubkey) {
+  return new TransactionInstruction({
+    programId: JOBS_PROGRAM_ID,
+    keys: [
+      { pubkey: jobPDA,           isSigner: false, isWritable: true },
+      { pubkey: configPDA,        isSigner: false, isWritable: true },
+      { pubkey: inscriberPubkey,  isSigner: false, isWritable: true },
+      { pubkey: treasuryPubkey,   isSigner: false, isWritable: true },
+      { pubkey: referrerPubkey,   isSigner: false, isWritable: true },
+      { pubkey: signerPubkey,     isSigner: true,  isWritable: false },
+    ],
+    data: IX_RELEASE_PAYMENT,
   });
 }
 
