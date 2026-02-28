@@ -2,8 +2,8 @@
 /**
  * register.js — Register this Freeze Dry node with the coordinator (freezedry.art).
  *
- * Phase 1: HTTP registration via coordinator API (shared API key).
- * Phase 3: On-chain PDA registration (trustless, drop-in replacement).
+ * Uses ed25519 wallet signature for auth (same as all other Freeze Dry APIs).
+ * Requires WALLET_KEYPAIR + NODE_URL in .env.
  *
  * Usage:
  *   node scripts/register.js              # register (reads .env)
@@ -14,7 +14,7 @@
 import { readFileSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
-import { Keypair } from '@solana/web3.js';
+import { sign, createPrivateKey } from 'crypto';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..');
@@ -41,33 +41,68 @@ loadEnv();
 
 // ─── Config ───
 const COORDINATOR_URL = process.env.COORDINATOR_URL || 'https://freezedry.art';
-const API_KEY = (process.env.API_KEY || '').trim();
 const NODE_URL = (process.env.NODE_URL || '').trim();
 const NODE_ID = (process.env.NODE_ID || 'freezedry-node').trim();
 const ROLE = (process.env.ROLE || 'both').toLowerCase();
-const PORT = process.env.PORT || '3100';
 
-// ─── Derive wallet pubkey (if writer) ───
-function getWalletPubkey() {
+// ─── Base58 encoding (inline — no dependency) ───
+const B58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+function encodeBase58(bytes) {
+  if (bytes.length === 0) return '';
+  const digits = [0];
+  for (let i = 0; i < bytes.length; i++) {
+    let carry = bytes[i];
+    for (let j = 0; j < digits.length; j++) {
+      carry += digits[j] << 8;
+      digits[j] = carry % 58;
+      carry = (carry / 58) | 0;
+    }
+    while (carry > 0) {
+      digits.push(carry % 58);
+      carry = (carry / 58) | 0;
+    }
+  }
+  let output = '';
+  for (let i = 0; i < bytes.length && bytes[i] === 0; i++) output += B58_ALPHABET[0];
+  for (let i = digits.length - 1; i >= 0; i--) output += B58_ALPHABET[digits[i]];
+  return output;
+}
+
+// DER prefix for Ed25519 PKCS8 private key (RFC 8410)
+const ED25519_PKCS8_PREFIX = Buffer.from('302e020100300506032b657004220420', 'hex');
+
+// ─── Wallet helpers ───
+function getKeypair() {
   const raw = (process.env.WALLET_KEYPAIR || '').trim();
   if (!raw) return null;
   try {
-    const kp = Keypair.fromSecretKey(new Uint8Array(JSON.parse(raw)));
-    return kp.publicKey.toBase58();
+    const bytes = new Uint8Array(JSON.parse(raw));
+    if (bytes.length !== 64) return null;
+    return {
+      seed: bytes.slice(0, 32),
+      pubkey: bytes.slice(32, 64),
+      pubkeyBase58: encodeBase58(bytes.slice(32, 64)),
+    };
   } catch {
     return null;
   }
 }
 
+function signMessage(message, seedBytes) {
+  const privateKeyObj = createPrivateKey({
+    key: Buffer.concat([ED25519_PKCS8_PREFIX, Buffer.from(seedBytes)]),
+    format: 'der',
+    type: 'pkcs8',
+  });
+  return sign(null, Buffer.from(message, 'utf-8'), privateKeyObj).toString('base64');
+}
+
 // ─── Validation ───
 function validate() {
   const issues = [];
-  if (!API_KEY) issues.push('API_KEY not set in .env — required for coordinator auth');
   if (!NODE_URL) issues.push('NODE_URL not set in .env — coordinator needs your public URL');
-  if (ROLE === 'writer' || ROLE === 'both') {
-    const pubkey = getWalletPubkey();
-    if (!pubkey) issues.push('WALLET_KEYPAIR not set or invalid — required for writer role');
-  }
+  if (!getKeypair()) issues.push('WALLET_KEYPAIR not set or invalid (need 64-byte JSON array)');
   return issues;
 }
 
@@ -79,8 +114,8 @@ async function register() {
   console.log(`  Node URL:     ${NODE_URL || '(not set)'}`);
   console.log(`  Role:         ${ROLE}`);
 
-  const pubkey = getWalletPubkey();
-  if (pubkey) console.log(`  Writer Wallet: ${pubkey}`);
+  const kp = getKeypair();
+  if (kp) console.log(`  Wallet:       ${kp.pubkeyBase58}`);
   console.log('');
 
   const issues = validate();
@@ -91,25 +126,25 @@ async function register() {
     process.exit(1);
   }
 
-  // Build registration payload
-  const payload = {
-    nodeId: NODE_ID,
-    nodeUrl: NODE_URL,
-    role: ROLE,
-    port: parseInt(PORT, 10),
-  };
-  if (pubkey) payload.walletPubkey = pubkey;
+  // Sign the registration message
+  const timestamp = Math.floor(Date.now() / 1000);
+  const message = `FreezeDry:node-register:${NODE_URL}:${timestamp}`;
+  const signature = signMessage(message, kp.seed);
 
   console.log('  Registering with coordinator...');
 
   try {
-    const resp = await fetch(`${COORDINATOR_URL}/api/nodes/register`, {
+    const resp = await fetch(`${COORDINATOR_URL}/api/nodes?action=register`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': API_KEY,
-      },
-      body: JSON.stringify(payload),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeId: NODE_ID,
+        nodeUrl: NODE_URL,
+        role: ROLE,
+        walletPubkey: kp.pubkeyBase58,
+        message,
+        signature,
+      }),
       signal: AbortSignal.timeout(15000),
     });
 
@@ -117,14 +152,9 @@ async function register() {
       const text = await resp.text().catch(() => '');
       console.error(`  Registration failed: ${resp.status} ${resp.statusText}`);
       if (text) console.error(`  Response: ${text}`);
-
-      // Helpful hints
-      if (resp.status === 401 || resp.status === 403) {
-        console.error('\n  Check that API_KEY in .env matches the key from the coordinator.');
-      }
-      if (resp.status === 404) {
-        console.error('\n  The coordinator may not have the /api/nodes/register endpoint yet.');
-        console.error('  For now, register manually via the Freeze Dry admin panel.');
+      if (resp.status === 502) {
+        console.error('\n  The coordinator could not reach your node.');
+        console.error('  Make sure your node is running and NODE_URL is publicly accessible.');
       }
       process.exit(1);
     }
@@ -132,8 +162,7 @@ async function register() {
     const data = await resp.json();
     console.log('  Registration successful!\n');
     console.log(`  Status:    ${data.status || 'active'}`);
-    if (data.apiKey) console.log(`  API Key:   ${data.apiKey} (save this if different from yours)`);
-    if (data.message) console.log(`  Message:   ${data.message}`);
+    console.log(`  Node URL:  ${data.nodeUrl}`);
     console.log('');
   } catch (err) {
     if (err.name === 'TimeoutError') {
@@ -149,12 +178,14 @@ async function register() {
 async function checkStatus() {
   console.log('\n  Checking registration status...\n');
 
-  if (!NODE_URL) {
-    console.error('  NODE_URL not set — cannot check status.');
+  const kp = getKeypair();
+  if (!NODE_URL || !kp) {
+    console.error('  NODE_URL and WALLET_KEYPAIR required for status check.');
     process.exit(1);
   }
 
-  // First, check local health
+  // Check local health
+  const PORT = process.env.PORT || '3100';
   try {
     const localResp = await fetch(`http://localhost:${PORT}/health`, {
       signal: AbortSignal.timeout(5000),
@@ -173,20 +204,26 @@ async function checkStatus() {
     console.log('  Local node: not running (start with: node src/server.js)\n');
   }
 
-  // Check if coordinator can reach us
+  // Check coordinator status
   try {
-    const resp = await fetch(`${COORDINATOR_URL}/api/nodes/status?url=${encodeURIComponent(NODE_URL)}`, {
-      headers: { 'X-API-Key': API_KEY },
-      signal: AbortSignal.timeout(10000),
-    });
+    const resp = await fetch(
+      `${COORDINATOR_URL}/api/nodes?action=status&nodeUrl=${encodeURIComponent(NODE_URL)}&wallet=${kp.pubkeyBase58}`,
+      { signal: AbortSignal.timeout(10000) },
+    );
     if (resp.ok) {
       const data = await resp.json();
       console.log('  Coordinator status:');
-      console.log(`    Registered: ${data.registered ? 'yes' : 'no'}`);
-      if (data.lastSeen) console.log(`    Last seen:  ${new Date(data.lastSeen).toISOString()}`);
-      if (data.role) console.log(`    Role:       ${data.role}`);
+      console.log(`    Status:      ${data.status}`);
+      console.log(`    Role:        ${data.role}`);
+      console.log(`    Last seen:   ${data.lastSeen ? new Date(data.lastSeen).toISOString() : 'never'}`);
+      console.log(`    Last healthy: ${data.lastHealthy ? new Date(data.lastHealthy).toISOString() : 'never'}`);
+      console.log(`    Fail count:  ${data.failCount}`);
+      console.log(`    Bad data:    ${data.badDataCount}`);
     } else if (resp.status === 404) {
-      console.log('  Coordinator: status endpoint not available yet (Phase 1)');
+      console.log('  Coordinator: node not registered');
+    } else {
+      const text = await resp.text().catch(() => '');
+      console.log(`  Coordinator: ${resp.status} — ${text}`);
     }
   } catch {
     console.log('  Coordinator: unreachable');
@@ -198,19 +235,26 @@ async function checkStatus() {
 async function deregister() {
   console.log('\n  Deregistering from coordinator...\n');
 
-  if (!API_KEY || !NODE_URL) {
-    console.error('  API_KEY and NODE_URL required for deregistration.');
+  const kp = getKeypair();
+  if (!NODE_URL || !kp) {
+    console.error('  NODE_URL and WALLET_KEYPAIR required for deregistration.');
     process.exit(1);
   }
 
+  const timestamp = Math.floor(Date.now() / 1000);
+  const message = `FreezeDry:node-deregister:${NODE_URL}:${timestamp}`;
+  const signature = signMessage(message, kp.seed);
+
   try {
-    const resp = await fetch(`${COORDINATOR_URL}/api/nodes/deregister`, {
+    const resp = await fetch(`${COORDINATOR_URL}/api/nodes?action=deregister`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'X-API-Key': API_KEY,
-      },
-      body: JSON.stringify({ nodeUrl: NODE_URL }),
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        nodeUrl: NODE_URL,
+        walletPubkey: kp.pubkeyBase58,
+        message,
+        signature,
+      }),
       signal: AbortSignal.timeout(10000),
     });
     if (resp.ok) {

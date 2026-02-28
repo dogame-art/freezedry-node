@@ -3,3 +3,6 @@ db/*.db
 db/*.db-wal
 db/*.db-shm
 .env
+.env.local
+.env.*.local
+*.log

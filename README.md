@@ -4,39 +4,41 @@ A lightweight indexer and cache node for the [Freeze Dry Protocol](https://githu
 
 Nodes scan the Solana blockchain for `FREEZEDRY:` pointer memos, fetch the associated chunk data, and serve reconstructed artwork blobs over HTTP. The chain is the source of truth; nodes are a discovery and caching layer.
 
-**Full app**: [freezedry.dogame.art](https://freezedry.dogame.art) — managed inscriptions, NFT minting, and fast hydration.
+**Full app**: [freezedry.art](https://freezedry.art) — managed inscriptions, NFT minting, and fast hydration.
 
 ## 5-Minute Setup
 
-### 1. Clone and install
+### Option A: Guided setup (recommended)
+
+```bash
+git clone https://github.com/dogame-art/freezedry-node.git
+cd freezedry-node
+bash scripts/setup.sh
+npm start
+```
+
+The setup wizard walks you through role selection, Helius key, wallet, and node identity. It generates `.env` with a secure `WEBHOOK_SECRET` automatically.
+
+### Option B: Manual setup
 
 ```bash
 git clone https://github.com/dogame-art/freezedry-node.git
 cd freezedry-node
 npm install
-```
-
-### 2. Configure environment
-
-```bash
 cp .env.example .env
+# Edit .env — at minimum set HELIUS_API_KEY and generate WEBHOOK_SECRET:
+#   openssl rand -hex 32
+npm start
 ```
 
-Open `.env` and fill in:
+### Required configuration
 
 | Variable | Required | What it is | Where to get it |
 |----------|----------|------------|-----------------|
 | `HELIUS_API_KEY` | Yes | Solana RPC access | [helius.dev](https://helius.dev) (free tier works) |
-| `WEBHOOK_SECRET` | Yes | Auth token for write endpoints | Generate any random string (e.g. `openssl rand -hex 32`) |
-| `SERVER_WALLET` | No | Wallet to index (default: official inscriber) | Change to index a different artist |
-| `PORT` | No | HTTP port (default: 3100) | |
-| `NODE_ID` | No | Name shown in /health | |
-
-### 3. Start
-
-```bash
-npm start
-```
+| `WEBHOOK_SECRET` | Yes | Auth for write endpoints | `openssl rand -hex 32` (setup.sh generates this) |
+| `NODE_URL` | For peers | Your node's public https URL | Your domain + reverse proxy |
+| `WALLET_KEYPAIR` | For registry | Solana keypair JSON array | `solana-keygen new` or setup.sh generates one |
 
 You should see:
 
@@ -45,60 +47,74 @@ Freeze Dry Node (my-freezedry-node) listening on :3100
 Indexer: starting (poll every 120s, wallet: 6ao3hnvK...)
 ```
 
-The node will immediately begin scanning the chain and caching artwork.
+The node immediately begins scanning the chain and caching artwork.
 
 ## How It Works
 
 ```
-Solana Chain                    Your Node                    Users
+Solana Chain                    Your Node                    Peers / CDN
     |                              |                           |
     |--- FREEZEDRY: pointer ------>| discover artwork           |
     |--- chunk memos ------------->| fetch & cache chunks       |
     |                              |                           |
     |                              |<-- GET /artwork/:hash ----| metadata
-    |                              |<-- GET /blob/:hash -------| cached blob
+    |                              |<-- GET /blob/:hash -------| cached blob (peers only)
     |                              |<-- GET /verify/:hash -----| SHA-256 proof
 ```
 
-**Discovery**: The indexer polls `getSignaturesForAddress` for the configured `SERVER_WALLET`, looking for `FREEZEDRY:` pointer memos. Each pointer contains a manifest hash, chunk count, and blob size.
+**Discovery**: The indexer polls for the configured `SERVER_WALLET`'s memo transactions, looking for `FREEZEDRY:` pointers. Each pointer contains a hash, chunk count, and blob size. Paginated — handles artworks with thousands of chunks.
 
-**Caching**: Once a pointer is found, the node fetches all chunk transactions, strips memo headers, and reassembles the `.hyd` blob into SQLite storage.
+**Caching**: Once a pointer is found, the node fetches all chunk transactions (paginated beyond API limits), strips memo headers, and stores the raw data in SQLite.
 
-**Serving**: Clients request artwork via HTTP. Blobs are served with immutable cache headers.
+**Peer Sync**: Before reading from chain, the node tries peers first. Peer blob downloads are instant HTTP — no RPC credits needed. Blobs from registered, liveness-verified peers are accepted with size sanity checks.
+
+**Serving**: Peers request blobs via HTTP. Only **complete** blobs are served — partial data is never sent.
 
 ## API Endpoints
 
-### Public (read)
+### Public (no auth)
+
+| Endpoint | Method | Returns |
+|----------|--------|---------|
+| `/health` | GET | Node status, indexed artwork count, peer count |
+| `/artwork/:hash` | GET | Artwork metadata (dimensions, mode, chunk count, complete status) |
+| `/artworks?limit=50&offset=0` | GET | List indexed artworks |
+| `/verify/:hash` | GET | SHA-256 verification of stored blob |
+
+### Peer-gated (registered peers only)
+
+| Endpoint | Method | How to access |
+|----------|--------|---------------|
+| `/blob/:hash` | GET | `X-Node-URL` header matching a registered peer |
+| `/sync/list` | GET | Same — lists available artworks for sync |
+| `/sync/chunks/:hash` | GET | Same — base64 blob for peer sync |
+| `/nodes` | GET | Same — list known peers (gossip discovery) |
+
+### Protected (require `WEBHOOK_SECRET`)
 
 | Endpoint | Method | Description |
 |----------|--------|-------------|
-| `/health` | GET | Node status, uptime, indexed count |
-| `/artwork/:hash` | GET | Artwork metadata (dimensions, mode, chunk count) |
-| `/artworks?limit=50&offset=0` | GET | List all indexed artworks |
-| `/blob/:hash` | GET | Raw `.hyd` blob (binary, cached 1 year) |
-| `/verify/:hash` | GET | SHA-256 verification against stored blob |
-| `/sync/list` | GET | List artworks for peer sync |
-| `/sync/chunks/:hash` | GET | Base64 blob for peer sync |
-| `/nodes` | GET | List known peer nodes (enables gossip) |
-
-### Protected (require `Authorization` header = `WEBHOOK_SECRET`)
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/ingest` | POST | Push artwork metadata from Vercel or peers |
+| `/ingest` | POST | Push artwork metadata (coordinator → node) |
 | `/webhook/helius` | POST | Receive real-time Helius webhook pushes |
-| `/sync/announce` | POST | Register a peer node URL (bidirectional) |
+
+### Peer discovery (public, rate-limited + liveness-verified)
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/sync/announce` | POST | Register a peer node URL (must be https, public IP, reachable) |
 
 ## Peer Network
 
-Nodes can connect to each other for faster syncing and network discovery.
+Nodes discover each other and sync blobs without using RPC credits.
 
 ### Setup
 
 ```bash
-# In .env — your node's public URL and known peers
+# In .env — your node's public URL
 NODE_URL=https://node.yourdomain.com
-PEER_NODES=https://node1.example.com,https://node2.example.com
+
+# Optional: bootstrap peers (otherwise discovered via coordinator)
+PEER_NODES=https://dehydrate.dogame.art,https://node.dogame.art
 ```
 
 ### How Peer Sync Works
@@ -107,34 +123,33 @@ PEER_NODES=https://node1.example.com,https://node2.example.com
 Your Node                          Peer Node
     |                                  |
     |--- POST /sync/announce --------->| "I exist at this URL"
+    |         (liveness check: peer pings your /health)
     |<-- POST /sync/announce ----------| "I exist too" (bidirectional)
     |                                  |
-    |--- GET /nodes ------------------>| "Here are all peers I know"
-    |    (gossip: discover more)       |
-    |                                  |
-    |--- GET /blob/:hash ------------->| "Here's the cached blob" (fast!)
-    |    (peer sync instead of chain)  |
+    |--- GET /blob/:hash ------------->| complete blob (fast!)
+    |    (peer sync — no RPC needed)   |
 ```
 
-1. **Bootstrap** — On startup, your node registers `PEER_NODES` and announces itself
-2. **Gossip** — Fetches `/nodes` from each peer to discover additional nodes
-3. **Peer Sync** — When filling incomplete artworks, tries peers first (instant HTTP) before chain reads (slow RPC). SHA-256 verified.
-4. **Bidirectional** — When a peer announces to you, your node announces back automatically
+1. **Announce** — Peer sends its URL. Your node verifies it's a live Freeze Dry node (pings `/health`), checks URL is https + public IP, then registers it
+2. **Bidirectional** — Your node announces back automatically
+3. **Parallel fill** — When filling incomplete artworks, tries peers first in batches of 4 (instant HTTP). Falls back to chain reads only if no peer has the data
+4. **Gossip** — Every ~20 minutes, nodes exchange peer lists to discover new nodes
 
-### Why Peer Sync Matters
+### Security
 
-Chain reads cost RPC credits and are slow (especially on free plans). Peer sync is:
-- **Free** — no RPC credits, just HTTP between nodes
-- **Fast** — direct blob transfer vs. fetching individual memo transactions
-- **Verified** — SHA-256 hash checked before storing, same as chain reads
-- **Fallback** — if no peer has the blob, falls back to chain reads automatically
+- **SSRF protection**: Only `https://` URLs with public IPs accepted. Private ranges (`10.x`, `192.168.x`, `169.254.x`, `.internal`, `.local`) blocked
+- **Liveness verification**: Announcing node must respond 200 on `/health` (no redirects)
+- **Rate limiting**: 10 announce requests/min per IP
+- **Peer-gated data**: Blob data requires active peer registration — no unauthenticated scraping
+- **Complete blobs only**: Partial/incomplete data is never served to peers
+- **Minimal exposure**: `/health` returns only status + counts. No memory, uptime, or internal details. API responses are explicitly shaped — no raw database rows
 
 ## Helius Plan Auto-Detection
 
 The node auto-detects your Helius plan on startup:
 
 - **Free key**: Uses standard RPC (`getSignaturesForAddress` + `getTransaction`). Works fine, slightly slower.
-- **Paid key (Developer+)**: Uses Enhanced API (`/v0/addresses/.../transactions`). ~50x cheaper in credits, faster indexing.
+- **Paid key (Developer+)**: Uses Enhanced API. ~50x cheaper in credits, faster indexing.
 
 Override with `USE_ENHANCED_API=true|false` in `.env` if needed.
 
@@ -143,16 +158,20 @@ Override with `USE_ENHANCED_API=true|false` in `.env` if needed.
 ```
 freezedry-node/
   src/
-    server.js    — Fastify HTTP server + route handlers
-    indexer.js   — Chain scanner (polling + webhook modes)
-    db.js        — SQLite storage (better-sqlite3)
+    server.js    — Fastify HTTP server + endpoints
+    indexer.js   — Chain scanner + peer sync + gossip
+    db.js        — SQLite storage (better-sqlite3, WAL mode)
+    config.js    — Protocol constants
+    wallet.js    — Keypair loader (writer only, optional)
+  scripts/
+    setup.sh     — Interactive setup wizard
+    register.js  — Manual PDA registration
   .env.example   — Configuration template
-  package.json   — 2 dependencies: fastify + better-sqlite3
 ```
 
-**Database**: SQLite via `better-sqlite3`. The database file (`freezedry.db`) is created automatically on first run. This is a cache — if you delete it, the node re-indexes from the chain.
+**Database**: SQLite via `better-sqlite3` with WAL mode for concurrent reads. Created automatically on first run. This is a cache — delete it to re-index from chain.
 
-**Dependencies**: Intentionally minimal. Only 2 runtime deps.
+**Dependencies**: 3 runtime deps: `fastify`, `better-sqlite3`, `@solana/web3.js` (optional — reader-only nodes work without it).
 
 ## Production Deployment
 
@@ -171,18 +190,41 @@ server {
 }
 ```
 
-### Process manager (pm2)
+### systemd service
+
+```ini
+[Unit]
+Description=Freeze Dry Node
+After=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/freezedry-node
+ExecStart=/usr/bin/node src/server.js
+Restart=on-failure
+MemoryMax=512M
+MemoryHigh=400M
+
+[Install]
+WantedBy=multi-user.target
+```
 
 ```bash
-npm install -g pm2
-pm2 start src/server.js --name freezedry-node
-pm2 save
-pm2 startup
+sudo systemctl enable freezedry-node
+sudo systemctl start freezedry-node
+```
+
+### Docker
+
+```bash
+docker compose up -d
+docker compose logs -f
 ```
 
 ### Helius Webhook (real-time indexing)
 
-Instead of polling every 2 minutes, configure a Helius webhook to push new transactions instantly:
+Instead of polling every 2 minutes, configure a Helius webhook for instant indexing:
 
 1. Go to [Helius Dashboard](https://dashboard.helius.dev) > Webhooks
 2. Create webhook watching the `SERVER_WALLET` address
@@ -190,48 +232,10 @@ Instead of polling every 2 minutes, configure a Helius webhook to push new trans
 4. Set auth header to your `WEBHOOK_SECRET`
 5. Select "Enhanced" format
 
-## How Indexing Works
-
-There are two ways your node discovers content:
-
-### 1. Chain Polling (primary)
-
-The indexer runs a polling loop every 2 minutes (configurable via `POLL_INTERVAL`):
-
-1. **Discover** — Scans the configured `SERVER_WALLET` for `FREEZEDRY:` pointer memos
-2. **Index** — Stores metadata (hash, chunk count, size) in local SQLite
-3. **Fill** — For each discovered artwork with no cached chunks, fetches the actual memo transactions from Solana using **your own** Helius key
-4. **Serve** — Chunks are reassembled into `.hyd` blobs and cached in SQLite
-
-After the initial scan, the node only checks for new transactions since the last known signature.
-
-### 2. Registry Seeding (optional bootstrap)
-
-If `REGISTRY_URL` is set in `.env`, the node does a one-time backfill on startup:
-
-1. Fetches the artwork list from a registry endpoint (metadata only — hash, chunk count, dimensions)
-2. Stores entries in local SQLite with `chunks: null`
-3. The regular fill loop then fetches actual chunk data from the chain
-
-**This only transfers metadata** (a table of contents). Actual artwork data always comes from the Solana blockchain using your own RPC credits. The registry just tells your node "these artworks exist" so it doesn't have to scan the entire chain history.
-
-```bash
-# Example: seed from the official Freeze Dry registry
-REGISTRY_URL=https://freezedry.dogame.art
-```
-
-## Security
-
-- All write endpoints (`/ingest`, `/webhook/helius`, `/sync/announce`) require the `Authorization` header to match `WEBHOOK_SECRET`
-- If `WEBHOOK_SECRET` is not set, write endpoints return `403` (read-only mode)
-- Read endpoints are rate-limited (120 req/min per IP)
-- Write endpoints are rate-limited (10 req/min per IP)
-- CORS is open (`*`) — nodes are public read APIs by design
-
 ## Related
 
-- [freezedry-protocol](https://github.com/dogame-art/freezedry-protocol) — SDK packages + standalone HTML tools
-- [freezedry.dogame.art](https://freezedry.dogame.art) — Full app with managed infrastructure
+- [freezedry-protocol](https://github.com/dogame-art/freezedry-protocol) — SDK packages + Anchor programs
+- [freezedry.art](https://freezedry.art) — Full app with managed infrastructure
 
 ## License
 

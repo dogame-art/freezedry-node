@@ -426,7 +426,9 @@ app.post('/ingest', async (req, reply) => {
   };
 });
 
-// ─── Gossip (epidemic blob propagation) ───
+// ─── Twilight Bark (epidemic blob propagation) ───
+// A bark heard around the world — one node gets the blob, barks it to peers,
+// they bark it to theirs. Every node in the network knows within minutes.
 
 const NODE_URL = process.env.NODE_URL || '';
 const GOSSIP_TIMEOUT = 10_000; // 10s per peer
@@ -869,8 +871,17 @@ async function flushPodReceiptsV2() {
       programId
     );
 
-    const results = await Promise.allSettled(
-      receipts.map(async (receipt) => {
+    // Sequential submission — nonces must land in order (on-chain requires nonce > last_nonce).
+    // Parallel submission risks nonce 5 landing before nonce 3, permanently burning nonce 3.
+    const { createHash: createSha256 } = await import('crypto');
+    const disc = createSha256('sha256')
+      .update('global:submit_receipt')
+      .digest()
+      .slice(0, 8);
+
+    let ok = 0, failed = 0;
+    for (const receipt of receipts) {
+      try {
         const msgBytes = Buffer.isBuffer(receipt.message) ? receipt.message : Buffer.from(receipt.message);
         const sigBytes = Buffer.isBuffer(receipt.signature) ? receipt.signature : Buffer.from(receipt.signature);
         const nonce = BigInt(receipt.nonce);
@@ -878,14 +889,7 @@ async function flushPodReceiptsV2() {
         // Parse epoch from message bytes 9-13
         const epoch = msgBytes.readUInt32LE(9);
 
-        // Derive PDAs
-        const nonceBuf = Buffer.alloc(8);
-        nonceBuf.writeBigUInt64LE(nonce);
-        const [receiptPDA] = PublicKey.findProgramAddressSync(
-          [Buffer.from('fd-pod-receipt'), nonceBuf],
-          programId
-        );
-
+        // Derive NodeEpoch PDA
         const epochBuf = Buffer.alloc(4);
         epochBuf.writeUInt32LE(epoch);
         const [nodeEpochPDA] = PublicKey.findProgramAddressSync(
@@ -900,14 +904,6 @@ async function flushPodReceiptsV2() {
           signature: sigBytes,
         });
 
-        // Build submit_receipt instruction manually (avoid Anchor IDL dependency)
-        // Discriminator: first 8 bytes of SHA-256("global:submit_receipt")
-        const { createHash: createSha256 } = await import('crypto');
-        const disc = createSha256('sha256')
-          .update('global:submit_receipt')
-          .digest()
-          .slice(0, 8);
-
         // Instruction data: discriminator(8) + nonce(u64 LE, 8) + epoch(u32 LE, 4) = 20 bytes
         const ixData = Buffer.alloc(20);
         disc.copy(ixData, 0);
@@ -917,7 +913,6 @@ async function flushPodReceiptsV2() {
         const submitIx = {
           keys: [
             { pubkey: configPDA, isSigner: false, isWritable: false },
-            { pubkey: receiptPDA, isSigner: false, isWritable: true },
             { pubkey: nodeEpochPDA, isSigner: false, isWritable: true },
             { pubkey: kp.publicKey, isSigner: true, isWritable: true },
             { pubkey: SYSVAR_INSTRUCTIONS_PUBKEY, isSigner: false, isWritable: false },
@@ -947,14 +942,16 @@ async function flushPodReceiptsV2() {
         await conn.confirmTransaction({ signature: sig, blockhash, lastValidBlockHeight }, 'confirmed');
 
         db.markReceiptSubmittedV2(receipt.nonce, sig);
-        return sig;
-      })
-    );
+        ok++;
+      } catch (err) {
+        app.log.warn(`POD v2: nonce ${receipt.nonce} failed — ${err.message}`);
+        failed++;
+        break; // Stop — later nonces depend on this one's last_nonce update
+      }
+    }
 
-    const ok = results.filter(r => r.status === 'fulfilled').length;
-    const failed = results.filter(r => r.status === 'rejected').length;
-    if (ok > 0) app.log.info(`POD v2: submitted ${ok} receipts on-chain`);
-    if (failed > 0) app.log.warn(`POD v2: ${failed} receipts failed`);
+    if (ok > 0) app.log.info(`POD v2: submitted ${ok} receipt(s) on-chain`);
+    if (failed > 0) app.log.warn(`POD v2: stopped at failure, ${failed} receipt(s) will retry next cycle`);
   } catch (err) {
     app.log.warn(`POD v2: flush failed — ${err.message}`);
   }

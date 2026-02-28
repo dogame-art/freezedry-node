@@ -159,7 +159,7 @@ const stmts = {
     VALUES (@nonce, @message, @signature, @timestamp)
   `),
   getUnsubmittedReceiptsV2: db.prepare(`
-    SELECT * FROM pod_receipts_v2 WHERE submitted = 0 ORDER BY timestamp ASC LIMIT ?
+    SELECT * FROM pod_receipts_v2 WHERE submitted = 0 ORDER BY nonce ASC LIMIT ?
   `),
   markReceiptSubmittedV2: db.prepare(`
     UPDATE pod_receipts_v2 SET submitted = 1, tx_sig = @txSig WHERE nonce = @nonce

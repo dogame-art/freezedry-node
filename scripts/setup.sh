@@ -230,12 +230,19 @@ if [ -n "$API_KEY" ]; then
   echo "API_KEY=$API_KEY" >> "$ENV_FILE"
 fi
 
+# Generate WEBHOOK_SECRET for peer sync authentication
+WEBHOOK_SECRET=$(openssl rand -hex 32)
+echo "" >> "$ENV_FILE"
+echo "# ─── Security ───" >> "$ENV_FILE"
+echo "WEBHOOK_SECRET=$WEBHOOK_SECRET" >> "$ENV_FILE"
+
 # Add discovery defaults
 cat >> "$ENV_FILE" << ENVEOF
 
 # ─── Discovery ───
 SERVER_WALLET=6ao3hnvKQJfmQ94xTMV34uLUP6azVNHzCfip1ic5Nafj
 REGISTRY_URL=https://freezedry.art/api/registry
+COORDINATOR_URL=https://freezedry.art
 ENVEOF
 
 echo "    .env written to: $ENV_FILE"

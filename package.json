@@ -11,8 +11,10 @@
     "register": "node scripts/register.js"
   },
   "dependencies": {
-    "@solana/web3.js": "^1.98.0",
     "better-sqlite3": "^11.7.0",
     "fastify": "^5.2.0"
+  },
+  "optionalDependencies": {
+    "@solana/web3.js": "^1.98.0"
   }
 }
